@@ -203,10 +203,15 @@ config:
       ## Path to the private key used for signing boot assets
       # signingKeyPath: ""
 
-  ## Configuration for Enterprise Authentication (htpasswd)
+  ## Configuration for Enterprise Authentication
   authentication:
     ## Enable Enterprise Authentication
     enabled: false
+    ## Authentication provider: htpasswd or auth0
+    ## The chart creates and mounts an htpasswd Secret only for htpasswd.
+    ## Supply Auth0 secrets through env/envFrom, and persistent API-token keys through
+    ## authentication.tokens.keyPaths together with extraVolumes/extraVolumeMounts.
+    provider: htpasswd
     ## Path to the htpasswd file containing user credentials (bcrypt hashes only)
     htpasswdPath: /etc/image-factory/auth/htpasswd
 
@@ -222,6 +227,13 @@ config:
         # ttl: 15m0s
       ## URL of the vulnerability database to use for scanning
       # databaseURL: https://grype.anchore.io/databases
+      ## Local time of day (HH:MM) at which the vulnerability database is updated.
+      ## Keep it after the upstream publish time (~06:40 UTC) so every replica serves
+      ## reports from the same database build. Empty disables the schedule.
+      # databaseUpdateAt: "07:00"
+      ## Directory the vulnerability database is installed into. The chart mounts the
+      ## grypeDB volume here, so a PVC keeps the database across restarts.
+      # databaseRootDir: /var/lib/grype
     ## Vulnerability Exploitability eXchange (VEX) configuration
     # vex:
       ## Cache configuration for VEX data
@@ -280,15 +292,16 @@ cacheSigningKey:
   # Generate using: openssl ecparam -name prime256v1 -genkey -noout -out cache-signing.key
   key: |-
 
-# -- Enterprise Authentication (htpasswd)
+# -- Enterprise htpasswd credentials
 # Requires the Enterprise image-factory build. The chart cannot verify image identity;
 # enabling this on a non-Enterprise image causes the app to ignore the configuration.
+# Used only when config.authentication.enabled=true and config.authentication.provider=htpasswd.
 auth:
   # -- Name of an existing Secret containing an "htpasswd" data key (bcrypt hashes only).
   # Example: kubectl create secret generic my-htpasswd --from-file=htpasswd=./users.htpasswd
   existingSecret: ""
   # @schema type:string
-  # -- If 'existingSecret' is empty and config.authentication.enabled=true, a Secret is created from this content.
+  # -- If 'existingSecret' is empty and the htpasswd provider is enabled, a Secret is created from this content.
   # Multiline htpasswd content. Bcrypt hashes only ($2y$/$2a$/$2b$).
   # Generate using: htpasswd -bnB user password >> users.htpasswd
   htpasswd: |-

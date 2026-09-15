@@ -21,6 +21,8 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/klauspost/compress/zstd"
 	"github.com/siderolabs/gen/value"
+	"github.com/siderolabs/gen/xerrors"
+	"github.com/siderolabs/go-vex/pkg/kernelversion"
 	"github.com/u-root/u-root/pkg/cpio"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
@@ -96,6 +98,45 @@ func (b *Builder) PayloadHash(ctx context.Context, schematicID, versionTag strin
 	return Hash(sc.Customization.SystemExtensions.OfficialExtensions, versionTag, string(arch)), nil
 }
 
+// KernelVersion returns the kernel package version from the canonical Talos SPDX.
+// The Talos kernel version is architecture-independent, so one architecture is
+// sufficient for a version-scoped VEX document.
+func (b *Builder) KernelVersion(ctx context.Context, versionTag string) (string, error) {
+	if !strings.HasPrefix(versionTag, "v") {
+		versionTag = "v" + versionTag
+	}
+
+	bundle := &Bundle{}
+	if err := b.extractTalosSPDX(ctx, bundle, versionTag, artifacts.ArchAmd64); err != nil {
+		return "", fmt.Errorf("failed to extract canonical Talos SPDX: %w", err)
+	}
+
+	return kernelVersionFromFiles(bundle.Files, artifacts.ArchAmd64)
+}
+
+func kernelVersionFromFiles(files []File, arch artifacts.Arch) (string, error) {
+	filename := fmt.Sprintf("talos-%s.spdx.json", arch)
+
+	for _, file := range files {
+		if file.Filename != filename {
+			continue
+		}
+
+		version, err := kernelversion.FromSPDXJSON(file.Content)
+		if err != nil {
+			return "", fmt.Errorf("failed to read kernel version from %q: %w", filename, err)
+		}
+
+		if version == "" {
+			return "", fmt.Errorf("kernel package is missing from %q", filename)
+		}
+
+		return version, nil
+	}
+
+	return "", fmt.Errorf("talos SPDX file %q is missing", filename)
+}
+
 // Build returns an SPDX bundle, building and caching if necessary.
 func (b *Builder) Build(ctx context.Context, schematicID, versionTag string, arch artifacts.Arch) (storage.Bundle, error) {
 	// Normalize version tag
@@ -121,11 +162,18 @@ func (b *Builder) Build(ctx context.Context, schematicID, versionTag string, arc
 	// in other fields share the same cached bundle.
 	sbomHash := Hash(sc.Customization.SystemExtensions.OfficialExtensions, versionTag, string(arch))
 
-	// Check cache first
-	if err := b.storage.Head(ctx, sbomHash); err == nil {
+	// Read and verify the cache entry before declaring a hit. A concurrent
+	// builder may have pushed the image but not signed it yet; treating that
+	// transient state as a miss makes this request join the same singleflight.
+	cachedBundle, err := b.storage.Get(ctx, sbomHash)
+	if err == nil {
 		ctxlog.Logger(ctx, b.logger).Debug("SPDX bundle cache hit", zap.String("schematic", schematicID), zap.String("version", versionTag), zap.String("arch", string(arch)))
 
-		return b.storage.Get(ctx, sbomHash)
+		return b.IdentifyAs(cachedBundle, sbomHash, schematicID, versionTag, arch)
+	}
+
+	if !xerrors.TagIs[storage.ErrNotFoundTag](err) {
+		return nil, fmt.Errorf("failed to get cached SPDX bundle: %w", err)
 	}
 
 	// Build the bundle using singleflight to prevent duplicate work
@@ -145,8 +193,103 @@ func (b *Builder) Build(ctx context.Context, schematicID, versionTag string, arc
 		}
 
 		// Retrieve from cache after building
-		return b.storage.Get(ctx, sbomHash)
+		return b.identifiedBundle(ctx, sbomHash, schematicID, versionTag, arch)
 	}
+}
+
+// identifiedBundle fetches the cached bundle and re-identifies it as the
+// schematic that asked for it.
+func (b *Builder) identifiedBundle(ctx context.Context, sbomHash, schematicID, versionTag string, arch artifacts.Arch) (storage.Bundle, error) {
+	bundle, err := b.storage.Get(ctx, sbomHash)
+	if err != nil {
+		return nil, err
+	}
+
+	return b.IdentifyAs(bundle, sbomHash, schematicID, versionTag, arch)
+}
+
+// IdentifyAs presents a bundle stored under sbomHash as belonging to schematicID,
+// substituting the document name and namespace as the bundle is read.
+func (b *Builder) IdentifyAs(bundle storage.Bundle, sbomHash, schematicID, versionTag string, arch artifacts.Arch) (storage.Bundle, error) {
+	fromNamespace, err := buildDocumentNamespace(b.externalURL, sbomHash, versionTag, string(arch))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build cached document namespace: %w", err)
+	}
+
+	toNamespace, err := buildDocumentNamespace(b.externalURL, schematicID, versionTag, string(arch))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build document namespace: %w", err)
+	}
+
+	return newIdentifiedBundle(bundle, []replacement{
+		{from: documentName(sbomHash, versionTag, string(arch)), to: documentName(schematicID, versionTag, string(arch))},
+		{from: fromNamespace, to: toNamespace},
+	})
+}
+
+// newIdentifiedBundle validates that every substitution preserves length before
+// wrapping the bundle.
+//
+// Size() keeps reporting the stored size, which the frontend has already sent as
+// Content-Length, so a substitution that changed the length would produce a
+// response body that contradicts its own framing. Both IDs are sha256 hex, so
+// this holds; if it ever stops holding, fail the request instead of serving a
+// truncated document.
+func newIdentifiedBundle(bundle storage.Bundle, replacements []replacement) (storage.Bundle, error) {
+	for _, rep := range replacements {
+		if len(rep.from) != len(rep.to) {
+			return nil, fmt.Errorf("document identity substitution %q -> %q would change the bundle size", rep.from, rep.to)
+		}
+	}
+
+	return &identifiedBundle{
+		Bundle:       bundle,
+		replacements: replacements,
+	}, nil
+}
+
+// replacement is a single from/to substitution applied to a served document.
+type replacement struct {
+	from string
+	to   string
+}
+
+// identifiedBundle wraps a cached bundle, substituting the document identity as
+// it is read.
+//
+// Only the two full name/namespace strings this package writes are substituted,
+// never the bare hash, so a package checksum that happens to share the hash's
+// shape cannot be touched. Schematic IDs and SBOM hashes are both 64-character
+// hex, so every substitution preserves length and the wrapped Size stays exact —
+// which keeps the Content-Length the frontend already sent from HEAD valid.
+type identifiedBundle struct {
+	storage.Bundle
+
+	replacements []replacement
+}
+
+// Reader implements storage.Bundle.
+func (b *identifiedBundle) Reader() (io.ReadCloser, error) {
+	r, err := b.Bundle.Reader()
+	if err != nil {
+		return nil, err
+	}
+
+	defer r.Close() //nolint:errcheck
+
+	// ponytail: buffers the document (~0.5-5 MB) to substitute in one pass. Swap
+	// for a streaming replacer carrying len(from)-1 bytes between chunks if this
+	// shows up in memory profiles.
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cached SPDX bundle: %w", err)
+	}
+
+	for _, rep := range b.replacements {
+		content = bytes.ReplaceAll(content, []byte(rep.from), []byte(rep.to))
+	}
+
+	return io.NopCloser(bytes.NewReader(content)), nil
 }
 
 // buildBundle creates and stores an SPDX bundle for a single architecture.
@@ -162,7 +305,9 @@ func (b *Builder) buildBundle(reqID string, sc *schematicpkg.Schematic, schemati
 	logger.Info("building SPDX bundle")
 
 	bundle := &Bundle{
-		SchematicID:  schematicID,
+		// Name the document by the cache key, not the schematic: this bundle is
+		// shared by every schematic with the same extensions, version and arch.
+		ID:           sbomHash,
 		TalosVersion: versionTag,
 		Arch:         string(arch),
 		ExternalURL:  b.externalURL,
@@ -238,7 +383,7 @@ func (b *Builder) extractTalosSPDX(ctx context.Context, bundle *Bundle, versionT
 }
 
 // extractSPDXFromInitramfs extracts SPDX files from the embedded SquashFS
-// inside the zstd-compressed CPIO initramfs asset, adding them to the bundle.
+// inside the compressed CPIO initramfs asset, adding them to the bundle.
 //
 //nolint:gocognit
 func (b *Builder) extractSPDXFromInitramfs(bundle *Bundle, bootAsset asset.BootAsset) error {
@@ -249,19 +394,19 @@ func (b *Builder) extractSPDXFromInitramfs(bundle *Bundle, bootAsset asset.BootA
 	}
 	defer assetReader.Close() //nolint:errcheck
 
-	// 2. Initialize the zstd decompressor
-	zr, err := zstd.NewReader(assetReader)
+	// 2. Initialize the decompressor used by this Talos version.
+	compressedReader, err := zstd.NewReader(assetReader)
 	if err != nil {
 		return fmt.Errorf("failed to create zstd reader: %w", err)
 	}
-	defer zr.Close() //nolint:errcheck
+	defer compressedReader.Close()
 
 	// 3. Decompress the entire CPIO archive into memory.
 	// Since both u-root's cpio and standard squashfs parsers require io.ReaderAt
 	// for random access, we must load the uncompressed stream.
-	uncompressedCPIO, err := io.ReadAll(zr)
+	uncompressedCPIO, err := io.ReadAll(compressedReader)
 	if err != nil {
-		return fmt.Errorf("failed to decompress zstd initramfs: %w", err)
+		return fmt.Errorf("failed to decompress initramfs: %w", err)
 	}
 
 	br := bytes.NewReader(uncompressedCPIO)

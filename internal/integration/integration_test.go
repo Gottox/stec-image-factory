@@ -21,10 +21,9 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/ory/dockertest"
-	dc "github.com/ory/dockertest/docker"
+	"github.com/moby/moby/api/types/network"
+	"github.com/ory/dockertest/v4"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 	"golang.org/x/sync/errgroup"
@@ -36,6 +35,14 @@ import (
 )
 
 func setupFactory(t *testing.T, options cmd.Options) (context.Context, string, string) {
+	t.Helper()
+
+	ctx, listenAddr, pxeAddr, _ := setupFactoryWithMetrics(t, options)
+
+	return ctx, listenAddr, pxeAddr
+}
+
+func setupFactoryWithMetrics(t *testing.T, options cmd.Options) (context.Context, string, string, string) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -88,7 +95,7 @@ func setupFactory(t *testing.T, options cmd.Options) (context.Context, string, s
 		return err == nil
 	}, 10*time.Second, 10*time.Millisecond)
 
-	return ctx, defaultAddr, pxeAddr
+	return ctx, defaultAddr, pxeAddr, options.Metrics.Addr
 }
 
 func setupCacheSigningKey(t *testing.T, options *cmd.Options) {
@@ -105,14 +112,8 @@ func setupCacheSigningKey(t *testing.T, options *cmd.Options) {
 	options.Cache.SigningKeyPath = optionsDir + "/cache-signing-key.pem"
 }
 
-func docker(t *testing.T) *dockertest.Pool {
-	pool, err := dockertest.NewPool("")
-	require.NoError(t, err)
-
-	err = pool.Client.Ping()
-	require.NoError(t, err)
-
-	return pool
+func docker(t *testing.T) dockertest.Pool {
+	return dockertest.NewPoolT(t, "")
 }
 
 func healthcheck(url string) func() error {
@@ -137,29 +138,25 @@ const (
 	s3Secret = "y1rE4xZnqO6xvM7L0jFD3EXAMPLEnG4K2vOfLp8Iv9"
 )
 
-func setupS3(t *testing.T, pool *dockertest.Pool, bucket string) string {
+func setupS3(t *testing.T, pool dockertest.Pool, bucket string) string {
 	t.Helper()
 
 	_, port := findListenAddr(t, "127.0.0.1")
 
-	res, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "minio/minio",
-		Tag:        "latest",
-		Cmd:        []string{"server", "/data"},
-		PortBindings: map[dc.Port][]dc.PortBinding{
-			"9000": {{HostPort: port}},
-		},
-		Env: []string{
+	// each call binds a freshly allocated host port, so the container can't be shared with another call
+	res := pool.RunT(
+		t,
+		"minio/minio",
+		dockertest.WithoutReuse(),
+		dockertest.WithCmd([]string{"server", "/data"}),
+		dockertest.WithPortBindings(network.PortMap{
+			network.MustParsePort("9000/tcp"): []network.PortBinding{{HostPort: port}},
+		}),
+		dockertest.WithEnv([]string{
 			fmt.Sprintf("MINIO_ROOT_USER=%s", s3Access),
 			fmt.Sprintf("MINIO_ROOT_PASSWORD=%s", s3Secret),
-		},
-	})
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		err := pool.Purge(res)
-		assert.NoError(t, err)
-	})
+		}),
+	)
 
 	endpoint := net.JoinHostPort("127.0.0.1", res.GetPort("9000/tcp"))
 	t.Logf("running MinIO on %q", endpoint)
@@ -170,10 +167,9 @@ func setupS3(t *testing.T, pool *dockertest.Pool, bucket string) string {
 	})
 	require.NoError(t, err)
 
-	err = pool.Retry(func() error {
+	require.NoError(t, pool.Retry(t.Context(), 30*time.Second, func() error {
 		return s3cli.MakeBucket(t.Context(), bucket, minio.MakeBucketOptions{ForceCreate: true})
-	})
-	require.NoError(t, err)
+	}))
 
 	return endpoint
 }
@@ -181,33 +177,29 @@ func setupS3(t *testing.T, pool *dockertest.Pool, bucket string) string {
 //go:embed testdata/templates/nginx.sh
 var nginxConfigTemplate string
 
-func setupMockCDN(t *testing.T, pool *dockertest.Pool, s3, bucket string) string {
+func setupMockCDN(t *testing.T, pool dockertest.Pool, s3, bucket string) string {
 	t.Helper()
 
 	_, port := findListenAddr(t, "127.0.0.1")
 
 	inlineEntrypoint := fmt.Appendf([]byte{}, nginxConfigTemplate, s3, bucket)
 
-	res, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "nginx",
-		Tag:        "1",
-		Cmd:        []string{"sh", "-c", string(inlineEntrypoint)},
-		PortBindings: map[dc.Port][]dc.PortBinding{
-			"80": {{HostPort: port}},
-		},
-	})
-	require.NoError(t, err)
+	// the entrypoint is baked per-bucket and the host port is freshly allocated, so the container can't be shared
+	nginx := pool.RunT(
+		t,
+		"nginx",
+		dockertest.WithoutReuse(),
+		dockertest.WithTag("1"),
+		dockertest.WithCmd([]string{"sh", "-c", string(inlineEntrypoint)}),
+		dockertest.WithPortBindings(network.PortMap{
+			network.MustParsePort("80/tcp"): []network.PortBinding{{HostPort: port}},
+		}),
+	)
 
-	t.Cleanup(func() {
-		err := pool.Purge(res)
-		assert.NoError(t, err)
-	})
-
-	endpoint := net.JoinHostPort("127.0.0.1", res.GetPort("80/tcp"))
+	endpoint := net.JoinHostPort("127.0.0.1", nginx.GetPort("80/tcp"))
 	t.Logf("running Nginx on %q", endpoint)
 
-	err = pool.Retry(healthcheck(fmt.Sprintf("http://%s/health", endpoint)))
-	require.NoError(t, err)
+	require.NoError(t, pool.Retry(t.Context(), 30*time.Second, healthcheck(fmt.Sprintf("http://%s/health", endpoint))))
 
 	return endpoint
 }
@@ -252,12 +244,18 @@ func setupEnterprise(t *testing.T, options *cmd.Options) {
 	}
 
 	options.Enterprise.VEX.Data = vexDataRepositoryFlag.OCIRepositoryOptions
+	options.Authentication.Tokens.Storage = tokenStorageRepositoryFlag.OCIRepositoryOptions
 
-	options.Enterprise.SPDX.Cache = spdxCacheRepositoryFlag.OCIRepositoryOptions
+	// Only when the caller has not chosen one: testScannerDBRotation runs a second factory
+	// that needs its own, and this would otherwise overwrite it.
+	if options.Enterprise.SPDX.Cache == cmd.DefaultOptions.Enterprise.SPDX.Cache {
+		options.Enterprise.SPDX.Cache = spdxCacheRepositoryFlag.OCIRepositoryOptions
+	}
 
 	// Skip if the caller already configured auth (e.g. reload tests that need
-	// explicit control over the htpasswd file path).
-	if options.Authentication.Enabled && options.Authentication.HTPasswdPath != "" {
+	// explicit control over the htpasswd file path, or auth0 tests that configure
+	// the provider directly).
+	if options.Authentication.Enabled && (options.Authentication.HTPasswdPath != "" || options.Authentication.Provider == cmd.AuthProviderAuth0) {
 		return
 	}
 
@@ -353,10 +351,16 @@ func commonTest(t *testing.T, options cmd.Options) {
 		testRegistryFrontend(ctx, t, listenAddr, baseURL)
 	})
 
+	t.Run("TestRegistryProxy", func(t *testing.T) {
+		t.Parallel()
+
+		testRegistryProxy(ctx, t, listenAddr, baseURL)
+	})
+
 	t.Run("TestLatestTagResolution", func(t *testing.T) {
 		t.Parallel()
 
-		testLatestTagResolution(ctx, t, listenAddr, baseURL)
+		testLatestTagResolution(t, listenAddr)
 	})
 
 	t.Run("TestMetaFrontend", func(t *testing.T) {
@@ -377,10 +381,22 @@ func commonTest(t *testing.T, options cmd.Options) {
 		testSPDXFrontend(ctx, t, baseURL)
 	})
 
+	t.Run("TestScannerDB", func(t *testing.T) {
+		t.Parallel()
+
+		testScannerDB(t, options)
+	})
+
 	t.Run("TestChecksumFrontend", func(t *testing.T) {
 		t.Parallel()
 
 		testChecksumFrontend(ctx, t, baseURL)
+	})
+
+	t.Run("TestAssetSignatureFrontend", func(t *testing.T) {
+		t.Parallel()
+
+		testAssetSignatureFrontend(ctx, t, baseURL)
 	})
 
 	t.Run("TestAuthFrontend", func(t *testing.T) {
@@ -421,6 +437,7 @@ func mustNewDefaultOCIRepository(s string) ociRepositoryFalg {
 }
 
 var (
+	cosignPath                     string
 	imageRegistryFlag              string
 	schematicFactoryRepositoryFlag = mustNewDefaultOCIRepository(cmd.DefaultOptions.Artifacts.Schematic.String())
 	installerExternalRepository    = mustNewDefaultOCIRepository(cmd.DefaultOptions.Artifacts.Installer.External.String())
@@ -429,10 +446,12 @@ var (
 	signingCacheRepository         = mustNewDefaultOCIRepository(cmd.DefaultOptions.Cache.OCI.String() + "sign")
 	vexDataRepositoryFlag          = mustNewDefaultOCIRepository(cmd.DefaultOptions.Enterprise.VEX.Data.String())
 	spdxCacheRepositoryFlag        = mustNewDefaultOCIRepository(cmd.DefaultOptions.Enterprise.SPDX.Cache.String())
+	tokenStorageRepositoryFlag     = mustNewDefaultOCIRepository(cmd.DefaultOptions.Authentication.Tokens.Storage.String())
 	extraExtensionsManifestFlag    = mustNewDefaultOCIRepository(cmd.DefaultOptions.Enterprise.ExtraExtensions.Manifest.String())
 )
 
 func init() {
+	flag.StringVar(&cosignPath, "test.cosign-path", "cosign", "path to the cosign binary")
 	flag.StringVar(&imageRegistryFlag, "test.image-registry", cmd.DefaultOptions.Artifacts.Core.Registry, "image registry")
 	flag.Var(&schematicFactoryRepositoryFlag, "test.schematic-service-repository", "schematic factory repository")
 	flag.Var(&installerExternalRepository, "test.installer-external-repository", "image repository for the installer (external)")
@@ -441,5 +460,6 @@ func init() {
 	flag.Var(&signingCacheRepository, "test.signing-cache-repository", "image repository for signatures of cached boot assets (used for S3+CDN tests)")
 	flag.Var(&vexDataRepositoryFlag, "test.vex-data-repository", "OCI repository for VEX data")
 	flag.Var(&spdxCacheRepositoryFlag, "test.spdx-cache-repository", "OCI repository for cached SPDX data")
+	flag.Var(&tokenStorageRepositoryFlag, "test.token-storage-repository", "OCI repository for the API token index")
 	flag.Var(&extraExtensionsManifestFlag, "test.extra-extensions-manifest", "OCI repository for extra extensions")
 }

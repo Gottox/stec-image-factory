@@ -23,12 +23,6 @@ import (
 	enterrors "github.com/siderolabs/image-factory/pkg/enterprise/errors"
 )
 
-// checksumSuffixes maps supported checksum file extensions to themselves.
-var checksumSuffixes = map[string]struct{}{
-	".sha512": {},
-	".sha256": {},
-}
-
 // handleImage handles downloading of boot assets.
 //
 //nolint:gocyclo,cyclop
@@ -40,25 +34,18 @@ func (f *Frontend) handleImage(ctx context.Context, w http.ResponseWriter, r *ht
 
 	path := p.ByName("path")
 
-	// Detect a checksum suffix early: strip it and record which algorithm was
-	// requested so we compute a checksum instead of streaming the asset bytes.
-	// This check must happen before schematic/version lookup so that
-	// non-enterprise builds return 402 regardless of schematic availability.
-	var checksumSuffix string
-
-	for suffix := range checksumSuffixes {
-		if strings.HasSuffix(path, suffix) {
-			checksumSuffix = suffix
-			path = strings.TrimSuffix(path, suffix)
-
-			break
-		}
-	}
-
-	wantChecksum := checksumSuffix != ""
+	// Detect enterprise sidecar suffixes before schematic/version lookup so
+	// non-enterprise builds reject them consistently regardless of asset validity.
+	path, sidecar := profile.SplitArtifactPath(path)
+	wantSignature := sidecar == profile.ArtifactSidecarSignature
+	wantChecksum := sidecar.IsChecksum()
 
 	if wantChecksum && f.checksummer == nil {
 		return xerrors.NewTaggedf[enterrors.NotEnabledTag]("enterprise not enabled: checksum endpoint is not available")
+	}
+
+	if wantSignature && f.signatureWriter == nil {
+		return xerrors.NewTaggedf[enterrors.NotEnabledTag]("enterprise signing is not enabled: signature endpoint is not available")
 	}
 
 	schematic, err := f.schematicFactory.Get(ctx, schematicID, f.options.AuthProvider)
@@ -76,7 +63,7 @@ func (f *Frontend) handleImage(ctx context.Context, w http.ResponseWriter, r *ht
 		return fmt.Errorf("error parsing version: %w", err)
 	}
 
-	prof, err := profile.ParseFromPath(path, version.String())
+	prof, err := profile.ParseArtifactPath(path, version.String())
 	if err != nil {
 		return fmt.Errorf("error parsing profile from path: %w", err)
 	}
@@ -99,6 +86,15 @@ func (f *Frontend) handleImage(ctx context.Context, w http.ResponseWriter, r *ht
 		return err
 	}
 
+	if wantSignature {
+		assetKey, hashErr := profile.Hash(prof)
+		if hashErr != nil {
+			return fmt.Errorf("error hashing asset profile: %w", hashErr)
+		}
+
+		return f.signatureWriter.WriteSignature(ctx, w, r, asset, assetKey, filename)
+	}
+
 	// Checksum path: delegate to the enterprise checksummer.
 	if wantChecksum {
 		reader, readerErr := asset.Reader()
@@ -106,7 +102,7 @@ func (f *Frontend) handleImage(ctx context.Context, w http.ResponseWriter, r *ht
 			return readerErr
 		}
 
-		return f.checksummer.WriteChecksum(ctx, w, r, reader, asset.Size(), filename, checksumSuffix)
+		return f.checksummer.WriteChecksum(ctx, w, r, reader, asset.Size(), filename, string(sidecar))
 	}
 
 	if asset, ok := asset.(cache.RedirectableAsset); ok && !disableRedirect && r.Method != http.MethodHead {

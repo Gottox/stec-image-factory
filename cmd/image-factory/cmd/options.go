@@ -5,13 +5,18 @@
 package cmd
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+
 	"github.com/siderolabs/image-factory/internal/remotewrap"
+	"github.com/siderolabs/image-factory/pkg/enterprise"
 )
 
 // Validate checks Options for inconsistencies that would otherwise produce
@@ -59,7 +64,61 @@ func (o *Options) Validate() error {
 		return fmt.Errorf("audit.mode must be one of %v, got %q", auditModeOptions, o.Audit.Mode)
 	}
 
-	return nil
+	return o.Authentication.validate()
+}
+
+// validate checks the settings required by the selected provider, so that a misconfiguration
+// fails at startup rather than on the first request.
+func (o AuthenticationOptions) validate() error {
+	if !o.Enabled {
+		return nil
+	}
+
+	switch o.Provider {
+	case AuthProviderHTPasswd:
+		if o.HTPasswdPath == "" {
+			return errors.New(`authentication.htpasswdPath is required when authentication.provider is "htpasswd"`)
+		}
+	case AuthProviderAuth0:
+		if o.Auth0.Domain == "" {
+			return errors.New(`authentication.auth0.domain is required when authentication.provider is "auth0"`)
+		}
+
+		if o.Auth0.Audience == "" {
+			return errors.New(`authentication.auth0.audience is required when authentication.provider is "auth0"`)
+		}
+
+		// Only the key's encoding is checked here; the provider validates the group.
+		if o.Auth0.SessionKey != "" {
+			key, err := o.Auth0.DecodedSessionKey()
+			if err != nil {
+				return fmt.Errorf("authentication.auth0.sessionKey must be base64-encoded: %w", err)
+			}
+
+			if len(key) != enterprise.Auth0SessionKeySize {
+				return fmt.Errorf("authentication.auth0.sessionKey must decode to %d bytes, got %d", enterprise.Auth0SessionKeySize, len(key))
+			}
+		}
+	default:
+		return fmt.Errorf("authentication.provider must be one of %v, got %q", authProviderOptions, o.Provider)
+	}
+
+	return o.Tokens.validate()
+}
+
+// validateTTLBounds checks that a [min, max] TTL range is sane and contains default. prefix
+// identifies the config path in error messages, e.g. "authentication.tokens.ttl.ephemeral".
+func validateTTLBounds(prefix string, minTTL, maxTTL, defaultTTL time.Duration) error {
+	switch {
+	case minTTL <= 0:
+		return fmt.Errorf("%s.min must be positive, got %s", prefix, minTTL)
+	case maxTTL < minTTL:
+		return fmt.Errorf("%s.max %s is below .min %s", prefix, maxTTL, minTTL)
+	case defaultTTL < minTTL || defaultTTL > maxTTL:
+		return fmt.Errorf("%s.default %s is outside [%s, %s]", prefix, defaultTTL, minTTL, maxTTL)
+	default:
+		return nil
+	}
 }
 
 // Options configures the behavior of the image factory.
@@ -354,8 +413,14 @@ type GSASigningOptions struct {
 	FulcioURL string `koanf:"fulcioURL"`
 
 	// RekorURL is the Rekor transparency log endpoint.
-	// Defaults to the public Sigstore instance.
+	// It must point at a Rekor v2 (tile-backed) log; Rekor v1 is no longer supported for signing.
+	// Setting it requires TSAURL as well, since Rekor v2 does not timestamp entries.
+	// If FulcioURL, RekorURL and TSAURL are all empty, the Sigstore public-good signing config is fetched from TUF.
 	RekorURL string `koanf:"rekorURL"`
+
+	// TSAURL is the RFC3161 timestamp authority endpoint.
+	// Required whenever RekorURL is set.
+	TSAURL string `koanf:"tsaURL"`
 }
 
 // CDNCacheOptions configures CDN-based cache for the image factory.
@@ -549,22 +614,235 @@ type ComponentsOptions struct {
 	// OverlayManifest is the image manifest for overlays.
 	OverlayManifest string `koanf:"overlayManifest"`
 
-	// Talosctl is the image containing the Talos CLI tool.
+	// Talosctl is the image containing the Talos CLI tool (talosctl-all).
 	Talosctl string `koanf:"talosctl"`
+
+	// ImageFactory is the image containing the Image Factory itself.
+	ImageFactory string `koanf:"imageFactory"`
 }
+
+// ImageMap maps each component to its registry-facing image name.
+func (c ComponentsOptions) ImageMap() map[string]string {
+	return map[string]string{
+		"installer-base": c.InstallerBase,
+		"installer":      c.Installer,
+		"imager":         c.Imager,
+		"extensions":     c.ExtensionManifest,
+		"overlays":       c.OverlayManifest,
+		"talosctl-all":   c.Talosctl,
+		"image-factory":  c.ImageFactory,
+	}
+}
+
+// Authentication providers select the backend that verifies caller identity.
+const (
+	// AuthProviderHTPasswd verifies credentials against a local htpasswd file. Default.
+	AuthProviderHTPasswd = "htpasswd"
+	// AuthProviderAuth0 validates Auth0-issued JWTs.
+	AuthProviderAuth0 = "auth0"
+)
+
+var authProviderOptions = []string{AuthProviderHTPasswd, AuthProviderAuth0}
 
 // AuthenticationOptions holds authentication settings.
 type AuthenticationOptions struct { //nolint:govet // keeping order for semantic clarity
 	// Enabled enables authentication.
 	Enabled bool `koanf:"enabled"`
+
+	// Provider selects the authentication backend.
+	// Valid values are "htpasswd" (default) and "auth0".
+	Provider string `koanf:"provider"`
+
 	// HTPasswdPath is the path to the htpasswd file containing user credentials.
 	//
 	// The file follows the standard htpasswd format (username:bcrypt_hash, one per line).
 	// Multiple entries with the same username are supported, allowing multiple API keys per user.
 	// Only bcrypt hashes ($2y$/$2a$/$2b$) are accepted.
 	//
-	// It is required if authentication is enabled.
+	// It is required when provider is "htpasswd" (the default).
 	HTPasswdPath string `koanf:"htpasswdPath"`
+
+	// Auth0 holds configuration for the Auth0 JWT authentication provider.
+	//
+	// Tokens must carry a non-empty string in the custom `if_org_id` claim,
+	// which becomes the caller identity in the same way a username does for htpasswd.
+	// Auth0's native `org_id` claim is not read.
+	//
+	// It is required when provider is "auth0", and ignored otherwise.
+	//
+	// Domain and audience alone validate bearer tokens.
+	// The browser-login fields are optional, and add the sign-in routes on top when set.
+	Auth0 Auth0Options `koanf:"auth0"`
+
+	// Tokens holds configuration for self-issued API token management.
+	Tokens TokenOptions `koanf:"tokens"`
+}
+
+// TokenOptions configures self-issued API token issuance, storage, and verification.
+type TokenOptions struct {
+	// KeyPaths is an ordered list of PEM-encoded ECDSA P-256 keys or certificates.
+	// The first entry must be a private key and is the only key used to mint tokens.
+	// Later entries are verification-only and may contain private keys, public keys, or X.509 certificates.
+	// If empty, a fresh in-memory key is generated at startup.
+	// Previously issued tokens then stop working after a restart,
+	// and tokens minted by one replica are not accepted by another, so this is suitable only for disposable single-process development.
+	KeyPaths []string `koanf:"keyPaths"`
+
+	// Storage is the base OCI repository under which stored token records are persisted; presence of a record is what makes such a token valid.
+	// Each provider-resolved principal gets its own repository beneath it, holding one tag per token,
+	// so a listing costs one principal's tokens rather than every token in the deployment.
+	// A token minted with "stored": false is not recorded, so it cannot be listed or revoked and does not count against MaxPerOrg.
+	Storage OCIRepositoryOptions `koanf:"storage"`
+
+	// TTL bounds token lifetimes by whether they are stored, plus the CLI-only bootstrap policy.
+	TTL TokenTTLOptions `koanf:"ttl"`
+
+	// RefreshInterval controls how often the backing registry clients are rebuilt
+	// so refreshed credentials are picked up.
+	RefreshInterval time.Duration `koanf:"refreshInterval"`
+
+	// MaxPerOrg caps how many stored tokens a provider-resolved principal may have active at once.
+	MaxPerOrg int `koanf:"maxPerOrg"`
+}
+
+// TokenTTLOptions bounds token lifetimes by revocability, plus the CLI-only bootstrap credential.
+//
+// A caller picks a lifetime with the `ttl` field of POST /tokens (e.g. `"ttl": "720h"`);
+// requests outside the selected [min, max] range are rejected with HTTP 400.
+type TokenTTLOptions struct {
+	// Stored bounds revocable tokens persisted in the configured OCI repository.
+	Stored TokenTTL `koanf:"stored"`
+
+	// Ephemeral bounds tokens with no per-token list or revoke operation.
+	// They normally leave circulation through expiry;
+	// removing a verification key retires every token signed by that key.
+	Ephemeral TokenTTL `koanf:"ephemeral"`
+
+	// Bootstrap bounds the CLI-only cross-subject credential.
+	// It is never stored and may live longer than ordinary ephemeral tokens because it is kept
+	// offline and retired by removing its signing key from KeyPaths.
+	Bootstrap TokenTTL `koanf:"bootstrap"`
+}
+
+// TokenTTL defines the validity duration for one token lifetime policy.
+type TokenTTL struct {
+	// Max is the longest validity duration a caller may request.
+	Max time.Duration `koanf:"max"`
+
+	// Min is the shortest validity duration a caller may request.
+	Min time.Duration `koanf:"min"`
+
+	// Default is the validity duration granted when the caller requests no explicit TTL.
+	Default time.Duration `koanf:"default"`
+}
+
+// EnterpriseOptions renders the token settings in the form pkg/enterprise takes. remoteOptions
+// only reaches the token index, so a caller that touches no storage may pass nil.
+func (o TokenOptions) EnterpriseOptions(remoteOptions []remote.Option) enterprise.TokenOptions {
+	return enterprise.TokenOptions{
+		KeyPaths: slices.Clone(o.KeyPaths),
+		BootstrapTTL: enterprise.TokenTTL{
+			Default: o.TTL.Bootstrap.Default,
+			Min:     o.TTL.Bootstrap.Min,
+			Max:     o.TTL.Bootstrap.Max,
+		},
+
+		StorageTTL:        o.StorageTTL(),
+		StorageRepository: o.Storage.String(),
+		StorageInsecure:   o.Storage.Insecure,
+		RemoteOptions:     remoteOptions,
+		RefreshInterval:   o.RefreshInterval,
+		MaxPerOrg:         o.MaxPerOrg,
+	}
+}
+
+// StorageTTL renders the stored/ephemeral lifetime policies in the form the token issuer takes.
+func (o TokenOptions) StorageTTL() enterprise.TokenStorageTTL {
+	return enterprise.TokenStorageTTL{
+		Stored: enterprise.TokenTTL{
+			Default: o.TTL.Stored.Default,
+			Min:     o.TTL.Stored.Min,
+			Max:     o.TTL.Stored.Max,
+		},
+		Ephemeral: enterprise.TokenTTL{
+			Default: o.TTL.Ephemeral.Default,
+			Min:     o.TTL.Ephemeral.Min,
+			Max:     o.TTL.Ephemeral.Max,
+		},
+	}
+}
+
+// validate checks that token lifetime bounds are sane and contain their defaults, and that the
+// per-org cap is positive, so a bad config fails at startup rather than on the first request.
+func (o TokenOptions) validate() error {
+	if err := validateTTLBounds("authentication.tokens.ttl.stored", o.TTL.Stored.Min, o.TTL.Stored.Max, o.TTL.Stored.Default); err != nil {
+		return err
+	}
+
+	if err := validateTTLBounds("authentication.tokens.ttl.ephemeral", o.TTL.Ephemeral.Min, o.TTL.Ephemeral.Max, o.TTL.Ephemeral.Default); err != nil {
+		return err
+	}
+
+	if err := validateTTLBounds("authentication.tokens.ttl.bootstrap", o.TTL.Bootstrap.Min, o.TTL.Bootstrap.Max, o.TTL.Bootstrap.Default); err != nil {
+		return err
+	}
+
+	switch {
+	case o.MaxPerOrg <= 0:
+		return fmt.Errorf("authentication.tokens.maxPerOrg must be positive, got %d", o.MaxPerOrg)
+	case o.RefreshInterval <= 0:
+		return fmt.Errorf("authentication.tokens.refreshInterval must be positive, got %s", o.RefreshInterval)
+	default:
+		return nil
+	}
+}
+
+// Auth0Options holds configuration for the Auth0 authentication provider.
+type Auth0Options struct {
+	// Domain is the Auth0 tenant domain, e.g. `mycompany.auth0.com`.
+	//
+	// Required.
+	Domain string `koanf:"domain"`
+
+	// Audience is the Auth0 API identifier (audience claim), e.g. `https://image-factory.example.com`.
+	//
+	// Required.
+	Audience string `koanf:"audience"`
+
+	// ClientID is the Auth0 application Client ID used for the browser login flow.
+	//
+	// Optional; part of the browser-login group.
+	ClientID string `koanf:"clientID"`
+
+	// ClientSecret is the Auth0 application Client Secret.
+	// Inject via IF_AUTHENTICATION_AUTH0_CLIENTSECRET environment variable.
+	//
+	// Optional; part of the browser-login group.
+	ClientSecret string `koanf:"clientSecret"`
+
+	// SessionKey is the base64-encoded 32-byte AES-256 key used to encrypt session cookies.
+	// Inject via IF_AUTHENTICATION_AUTH0_SESSIONKEY environment variable.
+	// Generate one with `openssl rand -base64 32`.
+	// Surrounding whitespace is trimmed, so a file or mounted secret with a trailing newline works.
+	// All replicas must share the same key, since a session or in-progress login started
+	// on one replica has to be decrypted by whichever replica handles the next request.
+	//
+	// Optional; part of the browser-login group.
+	SessionKey string `koanf:"sessionKey"`
+
+	// issuerURLOverride replaces the issuer URL constructed from Domain, for the expected
+	// iss claim and for the JWKS, authorize and token endpoints.
+	// Unexported so koanf cannot reach it; see SetAuth0IssuerURL, built only under the integration tag.
+	issuerURLOverride string
+}
+
+// DecodedSessionKey returns the session key bytes, or nil when none is configured.
+func (o Auth0Options) DecodedSessionKey() ([]byte, error) {
+	if o.SessionKey == "" {
+		return nil, nil
+	}
+
+	return base64.StdEncoding.DecodeString(strings.TrimSpace(o.SessionKey))
 }
 
 // EnterpriseOptions contains configuration for enterprise-specific features.
@@ -609,6 +887,19 @@ type ScannerOptions struct {
 	// DatabaseURL overrides the Grype vulnerability database listing URL.
 	// Set this to point at a mirror or air-gapped database service.
 	DatabaseURL string `koanf:"databaseURL"`
+
+	// DatabaseUpdateAt is the local time of day ("HH:MM") at which the Grype vulnerability database is updated.
+	// Empty disables the schedule, leaving the database at the build downloaded when the process started.
+	//
+	// Scan results depend on the database build, so replicas that started at different times otherwise disagree about the same report.
+	// Pick a time after the upstream database is published (Anchore publishes daily around 06:40 UTC) so every replica converges on the same build for the rest of the day.
+	// Times are interpreted in the process timezone (TZ, UTC in the container).
+	DatabaseUpdateAt string `koanf:"databaseUpdateAt"`
+
+	// DatabaseRootDir is where the Grype vulnerability database is installed.
+	// The Helm chart mounts a volume at the default path, so a persistent volume
+	// keeps the database (and the scan results it produces) across restarts.
+	DatabaseRootDir string `koanf:"databaseRootDir"`
 
 	// Cache contains configuration for caching vulnerability scan results.
 	Cache LRUCacheOptions `koanf:"cache"`
@@ -689,7 +980,38 @@ var DefaultOptions = Options{
 				ExtensionManifest: "siderolabs/extensions",
 				OverlayManifest:   "siderolabs/overlays",
 				Talosctl:          "siderolabs/talosctl-all",
+				ImageFactory:      "siderolabs/image-factory",
 			},
+		},
+	},
+
+	Authentication: AuthenticationOptions{
+		Provider: AuthProviderHTPasswd,
+		Tokens: TokenOptions{
+			Storage: OCIRepositoryOptions{
+				Registry:   "ghcr.io",
+				Namespace:  "siderolabs/image-factory",
+				Repository: "tokens",
+			},
+			TTL: TokenTTLOptions{
+				Stored: TokenTTL{
+					Default: 365 * 24 * time.Hour,
+					Max:     365 * 24 * time.Hour,
+					Min:     time.Hour,
+				},
+				Ephemeral: TokenTTL{
+					Default: 5 * time.Minute,
+					Max:     8 * time.Hour,
+					Min:     30 * time.Second,
+				},
+				Bootstrap: TokenTTL{
+					Default: 90 * 24 * time.Hour,
+					Max:     10 * 365 * 24 * time.Hour,
+					Min:     time.Hour,
+				},
+			},
+			RefreshInterval: 5 * time.Minute,
+			MaxPerOrg:       10,
 		},
 	},
 
@@ -721,7 +1043,9 @@ var DefaultOptions = Options{
 			},
 		},
 		Scanner: ScannerOptions{
-			DatabaseURL: "https://grype.anchore.io/databases",
+			DatabaseURL:      "https://grype.anchore.io/databases",
+			DatabaseUpdateAt: "07:00",
+			DatabaseRootDir:  "/var/lib/grype",
 			Cache: LRUCacheOptions{
 				TTL:      15 * time.Minute,
 				Capacity: 4096,

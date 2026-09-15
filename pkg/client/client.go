@@ -14,6 +14,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/siderolabs/image-factory/pkg/schematic"
 )
@@ -35,10 +36,36 @@ type OverlayInfo struct {
 	Digest string `json:"digest"`
 }
 
+// TokenInfo defines an API token list response item.
+type TokenInfo struct {
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Scopes         []string  `json:"scopes"`
+	IssuableScopes []string  `json:"issuable_scopes,omitempty"`
+}
+
+// Actor is a server-defined credential profile. The server expands it into executable and
+// issuable scopes; clients cannot override either scope set when selecting an actor.
+type Actor string
+
+const (
+	// ActorTalos can fetch generated images, PXE assets, and installer OCI artifacts.
+	ActorTalos Actor = "talos"
+	// ActorAutomation can operate schematics and reports and issue bounded Talos or Automation credentials.
+	ActorAutomation Actor = "automation"
+	// ActorOperator can operate schematics and reports, fetch generated products, and pull source artifacts.
+	ActorOperator Actor = "operator"
+	// ActorAdmin can manage credentials and issue every actor profile.
+	ActorAdmin Actor = "admin"
+)
+
 // Client is the Image Factory HTTP API client.
 type Client struct {
 	baseURL      *url.URL
 	extraHeaders http.Header
+	tokenSource  TokenSource
 	client       http.Client
 }
 
@@ -55,6 +82,7 @@ func New(baseURL string, options ...Option) (*Client, error) {
 		baseURL:      bURL,
 		client:       opts.Client,
 		extraHeaders: opts.ExtraHeaders,
+		tokenSource:  opts.TokenSource,
 	}
 
 	return c, nil
@@ -175,6 +203,115 @@ func (c *Client) OverlaysVersions(ctx context.Context, talosVersion string) ([]O
 	return versions, nil
 }
 
+// DownloadToken requests a short-lived JWT token carrying image:read, scoped to the
+// authenticated caller's identity. The token can be appended as ?token= to any image download
+// URL, and to a PXE script URL, which forwards it into the asset URLs of the script; one token
+// covers all schematics owned by the caller.
+//
+// A positive ttl requests that lifetime, which the server accepts only within its
+// configured bounds; zero or less takes the server default.
+//
+// The token is not stored, so expiry is its only revocation mechanism and its lifetime is bounded
+// by the server's authentication.tokens.ttl.ephemeral policy. Storage is independent of URL use;
+// both stored and ephemeral tokens may travel in a URL when their scopes are URL-safe.
+func (c *Client) DownloadToken(ctx context.Context, ttl time.Duration) (string, error) {
+	_, token, err := c.TokenCreate(ctx, TokenCreateOptions{
+		Scopes:    []string{"image:read"},
+		TTL:       ttl,
+		Ephemeral: true,
+	})
+
+	return token, err
+}
+
+// TokenList returns the caller's currently active stored tokens.
+func (c *Client) TokenList(ctx context.Context) ([]TokenInfo, error) {
+	var response struct {
+		Tokens []TokenInfo `json:"tokens"`
+	}
+
+	if err := c.do(ctx, http.MethodGet, "/tokens", &response); err != nil {
+		return nil, err
+	}
+
+	return response.Tokens, nil
+}
+
+// TokenCreateOptions describes a credential to mint. Actor selects a fixed server-owned profile;
+// otherwise Scopes and IssuableScopes define the executable and delegation capabilities directly.
+// Subject is normally empty; only the CLI bootstrap credential may mint for another identity.
+// Credentials are stored and revocable by default; Ephemeral explicitly opts out.
+type TokenCreateOptions struct {
+	Name           string
+	Subject        string
+	Actor          Actor
+	Scopes         []string
+	IssuableScopes []string
+	TTL            time.Duration
+	Ephemeral      bool
+}
+
+// TokenCreate mints a credential, returning its ID and the credential itself. The credential is
+// only returned at creation time and cannot be retrieved afterward.
+//
+// A stored credential is recorded by the factory, so it can be listed and revoked, requires a
+// name, and counts against the per-org cap. A non-stored credential is retired only by expiry.
+// Actor cannot be combined with Scopes or IssuableScopes; the server expands actor profiles.
+func (c *Client) TokenCreate(ctx context.Context, opts TokenCreateOptions) (id, token string, err error) {
+	if opts.Actor != "" && (opts.Scopes != nil || opts.IssuableScopes != nil) {
+		return "", "", fmt.Errorf("actor cannot be combined with explicit scopes")
+	}
+
+	request := struct {
+		Stored         *bool    `json:"stored,omitempty"`
+		Name           string   `json:"name"`
+		Subject        string   `json:"subject,omitempty"`
+		Actor          Actor    `json:"actor,omitempty"`
+		TTL            string   `json:"ttl,omitempty"`
+		Scopes         []string `json:"scopes,omitempty"`
+		IssuableScopes []string `json:"issuable_scopes,omitempty"`
+	}{
+		Name:           opts.Name,
+		Subject:        opts.Subject,
+		Actor:          opts.Actor,
+		Scopes:         opts.Scopes,
+		IssuableScopes: opts.IssuableScopes,
+	}
+
+	if opts.Ephemeral {
+		request.Stored = new(false)
+	}
+
+	if opts.TTL > 0 {
+		request.TTL = opts.TTL.String()
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", "", err
+	}
+
+	var response struct {
+		ID    string `json:"id"`
+		Token string `json:"token"`
+	}
+
+	if err := c.do(
+		ctx, http.MethodPost, "/tokens", &response,
+		WithRequestData(body),
+		WithHeaders(map[string]string{"Content-Type": "application/json"}),
+	); err != nil {
+		return "", "", err
+	}
+
+	return response.ID, response.Token, nil
+}
+
+// TokenRevoke revokes the token with the given ID.
+func (c *Client) TokenRevoke(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/tokens/%s/revoke", id), nil)
+}
+
 // ScanReport downloads a vulnerability scan report for the given schematic, Talos version,
 // architecture, and report filename. The filename extension selects the report format:
 // ".sarif" → SARIF, ".cdx" → CycloneDX, ".json" → JSON, ".table" → plain-text table.
@@ -183,6 +320,34 @@ func (c *Client) ScanReport(ctx context.Context, schematicID, talosVersion, arch
 
 	if err := c.do(ctx, http.MethodGet,
 		fmt.Sprintf("/scans/%s/%s/%s/%s", schematicID, talosVersion, arch, filename),
+		&data); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// SPDXBundle downloads the SPDX SBOM bundle for the given schematic, Talos version, and
+// architecture, as "application/spdx+json".
+func (c *Client) SPDXBundle(ctx context.Context, schematicID, talosVersion, arch string) ([]byte, error) {
+	var data []byte
+
+	if err := c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/spdx/%s/%s/%s", schematicID, talosVersion, arch),
+		&data); err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+// VEXDocument downloads the VEX document for the given Talos version, as "application/json".
+// VEX data is version-scoped, not schematic-scoped.
+func (c *Client) VEXDocument(ctx context.Context, talosVersion string) ([]byte, error) {
+	var data []byte
+
+	if err := c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/vex/%s/vex.json", talosVersion),
 		&data); err != nil {
 		return nil, err
 	}
@@ -249,6 +414,17 @@ func (c *Client) do(ctx context.Context, method, uri string, responseData any, o
 	}
 
 	maps.Copy(req.Header, c.extraHeaders)
+
+	if c.tokenSource != nil {
+		token, tokenErr := c.tokenSource(ctx)
+		if tokenErr != nil {
+			return fmt.Errorf("failed to get token: %w", tokenErr)
+		}
+
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {

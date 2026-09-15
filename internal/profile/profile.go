@@ -280,6 +280,107 @@ type ArtifactProducer interface {
 	InstallerImageName(string) string
 }
 
+// DependencyArtifactProducer resolves both the local OCI layout and the exact
+// platform manifest consumed from it.
+type DependencyArtifactProducer interface {
+	ArtifactProducer
+	GetInstallerDependency(context.Context, artifacts.Arch, string) (artifacts.ImageDependency, error)
+	GetExtensionDependency(context.Context, artifacts.Arch, artifacts.ExtensionRef) (artifacts.ImageDependency, error)
+	GetOverlayDependency(context.Context, artifacts.Arch, artifacts.OverlayRef) (artifacts.ImageDependency, error)
+}
+
+// EnhancementDependency records an immutable image input selected while
+// enhancing a profile.
+type EnhancementDependency struct {
+	Kind  string
+	Arch  artifacts.Arch
+	Image artifacts.ImageDependency
+}
+
+// EnhancementResult contains the enhanced profile and the image inputs that
+// were actually selected to build it.
+type EnhancementResult struct {
+	Profile      profile.Profile
+	Dependencies []EnhancementDependency
+}
+
+type dependencyCapturingProducer struct {
+	DependencyArtifactProducer
+
+	seen         map[string]struct{}
+	dependencies []EnhancementDependency
+}
+
+func (producer *dependencyCapturingProducer) capture(kind string, arch artifacts.Arch, dependency artifacts.ImageDependency) string {
+	key := fmt.Sprintf("%s|%s|%s", kind, arch, dependency.Ref)
+	if _, ok := producer.seen[key]; !ok {
+		producer.seen[key] = struct{}{}
+		producer.dependencies = append(producer.dependencies, EnhancementDependency{Kind: kind, Arch: arch, Image: dependency})
+	}
+
+	return dependency.OCIPath
+}
+
+func (producer *dependencyCapturingProducer) GetInstallerImage(ctx context.Context, arch artifacts.Arch, version string) (string, error) {
+	dependency, err := producer.GetInstallerDependency(ctx, arch, version)
+	if err != nil {
+		return "", err
+	}
+
+	return producer.capture("base-installer", arch, dependency), nil
+}
+
+func (producer *dependencyCapturingProducer) GetExtensionImage(ctx context.Context, arch artifacts.Arch, ref artifacts.ExtensionRef) (string, error) {
+	dependency, err := producer.GetExtensionDependency(ctx, arch, ref)
+	if err != nil {
+		return "", err
+	}
+
+	return producer.capture("extension", arch, dependency), nil
+}
+
+func (producer *dependencyCapturingProducer) GetOverlayImage(ctx context.Context, arch artifacts.Arch, ref artifacts.OverlayRef) (string, error) {
+	dependency, err := producer.GetOverlayDependency(ctx, arch, ref)
+	if err != nil {
+		return "", err
+	}
+
+	return producer.capture("overlay", arch, dependency), nil
+}
+
+// EnhanceFromSchematicWithDependencies enhances a profile while retaining the
+// immutable image dependencies selected by that exact operation.
+func EnhanceFromSchematicWithDependencies(
+	ctx context.Context,
+	prof profile.Profile,
+	schematic *schematicpkg.Schematic,
+	artifactProducer DependencyArtifactProducer,
+	secureBootService *secureboot.Service,
+	versionTag string,
+) (EnhancementResult, error) {
+	capturingProducer := &dependencyCapturingProducer{
+		DependencyArtifactProducer: artifactProducer,
+		seen:                       map[string]struct{}{},
+	}
+
+	enhancedProfile, err := EnhanceFromSchematic(ctx, prof, schematic, capturingProducer, secureBootService, versionTag)
+	if err != nil {
+		return EnhancementResult{}, err
+	}
+
+	for _, dependency := range capturingProducer.dependencies {
+		if dependency.Kind == "base-installer" {
+			// Bind the asset cache identity to the immutable base Installer selected above.
+			// This intentionally invalidates entries keyed by the former synthetic tag.
+			enhancedProfile.Input.BaseInstaller.ImageRef = dependency.Image.Ref.String()
+
+			break
+		}
+	}
+
+	return EnhancementResult{Profile: enhancedProfile, Dependencies: capturingProducer.dependencies}, nil
+}
+
 func findExtension(availableExtensions []artifacts.ExtensionRef, extensionName string) artifacts.ExtensionRef {
 	for _, availableExtension := range availableExtensions {
 		if availableExtension.TaggedReference.RepositoryStr() == extensionName {
@@ -339,6 +440,14 @@ func EnhanceFromSchematic(
 			}
 
 			prof.Customization.EmbeddedMachineConfiguration = schematic.Customization.EmbeddedMachineConfiguration
+		}
+	}
+
+	if shouldAutoSignInstaller(prof, secureBootService, versionTag) {
+		if _, err := secureBootService.GetSecureBootAssets(); err == nil {
+			prof.SecureBoot = new(true)
+		} else if !errors.Is(err, secureboot.ErrDisabled) {
+			return prof, err
 		}
 	}
 
@@ -550,6 +659,20 @@ func setKernelArgsAndMeta(prof *profile.Profile, schematic *schematicpkg.Schemat
 			},
 		)...,
 	)
+}
+
+func shouldAutoSignInstaller(
+	prof profile.Profile,
+	secureBootService *secureboot.Service,
+	versionTag string,
+) bool {
+	q := quirks.New(versionTag)
+
+	return !prof.SecureBootEnabled() &&
+		prof.Output.Kind == profile.OutKindInstaller &&
+		q.SupportsUnifiedInstaller() &&
+		!q.ForcesLockdownConfidentiality() &&
+		secureBootService != nil
 }
 
 // MergeOverlayProfile merges the overlay profile into the main profile.

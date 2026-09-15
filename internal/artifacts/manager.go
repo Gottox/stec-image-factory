@@ -126,6 +126,7 @@ func NewManager(logger *zap.Logger, options Options) (*Manager, error) {
 	for _, arch := range []Arch{ArchAmd64, ArchArm64} {
 		pullers[arch], err = remotewrap.NewPuller(
 			options.RegistryRefreshInterval,
+			nil,
 			append(
 				[]remote.Option{
 					remote.WithPlatform(v1.Platform{
@@ -134,7 +135,7 @@ func NewManager(logger *zap.Logger, options Options) (*Manager, error) {
 					}),
 				},
 				options.RemoteOptions...,
-			)...,
+			),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create puller: %w", err)

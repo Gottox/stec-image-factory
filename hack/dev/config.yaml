@@ -36,11 +36,58 @@ cache:
 
 http:
   # external URL the Image Factory is available at
-  externalURL: http://localhost:8080
+  externalURL: http://builder.cat-gacrux.ts.net:8080
 
 authentication:
-  enabled: false
+  enabled: true
+  provider: htpasswd
   htpasswdPath: /etc/image-factory/htpasswd
+
+  # Self-issued API tokens, served at /tokens and /ui/tokens.
+  # These need authentication.enabled above. A token is issued to whatever
+  # identity the provider resolves, so with auth off there is nobody to issue
+  # one to and the factory does not register the routes.
+  tokens:
+    # keyPaths is left unset on purpose. The factory then generates a key pair at
+    # startup, which is fine for the single replica this compose file runs. Point
+    # the first entry at a PEM-encoded ECDSA P-256 private key to keep tokens valid
+    # across restarts. Later entries are verification-only rotation keys or certificates.
+    # keyPaths:
+    #   - /etc/image-factory/token-signing-key.key
+
+    # private registry repository for the per-org index of stored tokens
+    storage:
+      registry: registry.local:5000
+      namespace: image-factory
+      repository: tokens
+      insecure: true
+
+    # how often the registry clients are rebuilt so refreshed credentials are picked up
+    refreshInterval: 5s
+
+    maxPerOrg: 10
+
+    ttl:
+      # Revocable credentials. The minimum is short here so expiry is easy to observe.
+      stored:
+        default: 8760h
+        min: 1m
+        max: 8760h
+
+      # Short-lived credentials, including ?token= download links and PXE scripts.
+      ephemeral:
+        default: 5m
+        min: 30s
+        max: 8h
+
+      # CLI-only bootstrap credential used for cross-subject provisioning. It is never stored,
+      # so the ordinary ephemeral policy does not apply to it. Short here because the
+      # dev key is regenerated freely; production keeps 90d.
+      bootstrap:
+        default: 1h
+        min: 1m
+        max: 24h
+
 
 enterprise:
   # extraExtensions:

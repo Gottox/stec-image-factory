@@ -23,11 +23,13 @@ The official Image Factory is available at [https://factory.talos.dev](https://f
 ## LLM Usage
 
 The file is maintained at [`internal/frontend/http/templates/llms.txt`](internal/frontend/http/templates/llms.txt) and was generated with the assistance of AI Agent.
+Running instances expose the rendered reference at `/llms.txt` and the canonical OpenAPI 3.1 contract at `/openapi.yaml`; both routes are public.
 
 ## Documentation
 
 * [API reference](docs/api.md)
 * [Configuration](docs/configuration.md)
+* [Authentication](docs/authentication.md)
 * [Required Source Container Images](docs/sources.md)
 * [Air-gapped Deployment](docs/air-gapped.md)
 * [Cache](docs/cache.md)
@@ -36,7 +38,6 @@ The file is maintained at [`internal/frontend/http/templates/llms.txt`](internal
 
 ## License
 
-The Image Factory is licensed under the [Mozilla Public License, version 2.0](LICENSE), except for the code in the `enterprise/` folder,
-which is licensed under the [Business Source License 1.1](enterprise/LICENSE).
+The Image Factory is licensed under the [Mozilla Public License, version 2.0](LICENSE), except for the code in the `enterprise/` folder, which is licensed under the [Business Source License 1.1](enterprise/LICENSE).
 
 The enterprise code is not included in the open source version of Image Factory, and it is not built by default.

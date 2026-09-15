@@ -23,8 +23,8 @@ To stop:
 make docker-compose-down
 ```
 
-By default, authentication is disabled for local development, enable it by setting `authentication.enabled` to `true` in the config file (`hack/dev/config.yaml`), and providing a valid `htpasswd` file at the path specified by `authentication.htpasswdPath`.
-Optionally use the existing htpasswd file at `hack/dev/htpasswd` for testing.
+Local development enables authentication by default and uses the htpasswd provider.
+The Compose configuration mounts `hack/dev/htpasswd` at the configured `/etc/image-factory/htpasswd` path.
 
 When running `make docker-compose-up` or the integration tests, the extra extension catalog and an extra extension image and their signatures are automatically pushed to the local registry.
 You can push the extra images manually with `push-extra-extensions`, optionally setting the `EXTRA_EXTENSIONS_REGISTRY`.
@@ -90,8 +90,7 @@ Integration tests can be run with specific targets:
 - `integration-proxy-installer`
 - `integration-enterprise`
 
-Example running direct integration tests with registry mirrors
-(`127.0.0.1:5004` is a registry mirror for `ghcr.io`, `127.0.0.1:5100` is an ephemeral local registry brought up by `make` automatically, and `127.0.0.1:5005` is a local registry for pushing images):
+Example running direct integration tests with registry mirrors (`127.0.0.1:5004` is a registry mirror for `ghcr.io`, `127.0.0.1:5100` is an ephemeral local registry brought up by `make` automatically, and `127.0.0.1:5005` is a local registry for pushing images):
 
 ```bash
 make integration-direct TEST_FLAGS="-test.image-registry=127.0.0.1:5004 -test.schematic-service-repository=127.0.0.1:5100/image-factory/schematic -test.installer-external-repository=127.0.0.1:5100/test -test.installer-internal-repository=127.0.0.1:5100/test -test.cache-repository=127.0.0.1:5100/image-factory/cache -test.signing-cache-repository=127.0.0.1:5100/image-factory/signing-cache -test.extra-extensions-manifest=127.0.0.1:5100/extension-testing/extensions" REGISTRY=127.0.0.1:5005

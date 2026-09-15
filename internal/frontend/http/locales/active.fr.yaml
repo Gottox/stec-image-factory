@@ -40,6 +40,9 @@
 - id: info.version
   translation: "Version"
 
+- id: nav.logout
+  translation: "Se déconnecter"
+
 - id: interface.loading
   translation: "Chargement..."
 
@@ -319,6 +322,12 @@
 - id: final.extra.checksum_enterprise_feature
   translation: "Les sommes de contrôle sont uniquement disponibles via la Talos Linux Enterprise Image Factory."
 
+- id: final.extra.signature_enterprise_feature
+  translation: "Les signatures sont uniquement disponibles via la Talos Linux Enterprise Image Factory."
+
+- id: final.extra.signature_hint
+  translation: "Bundle Sigstore détaché à vérifier avec cosign verify-blob."
+
 - id: final.scan.title
   translation: "Analyse des vulnérabilités"
 
@@ -378,3 +387,114 @@
 
 - id: final.booter.command_post
   translation: " avec ce schéma, exécutez la commande suivante sur un hôte dans le même sous-réseau :"
+
+- id: tokens.nav_link
+  translation: "Gérer les jetons d'API"
+
+- id: tokens.title
+  translation: "Jetons d'API"
+
+- id: tokens.back_home
+  translation: "Accueil"
+
+- id: tokens.description
+  translation: "Les jetons d'API sont des identifiants émis par cette factory. Choisissez l'acteur qui utilisera le jeton ; la factory lui attribue un profil de capacités fixe défini par le serveur."
+
+- id: tokens.table.name
+  translation: "Nom"
+
+- id: tokens.table.expires
+  translation: "Expiration"
+
+- id: tokens.table.expired
+  translation: "expiré"
+
+- id: tokens.table.created
+  translation: "Créé le"
+
+- id: tokens.table.permissions
+  translation: "Autorisations"
+
+- id: tokens.empty
+  translation: "Aucun jeton pour le moment."
+
+- id: tokens.create.name_label
+  translation: "Nom"
+
+- id: tokens.create.ttl_label
+  translation: "Durée de vie"
+
+- id: tokens.create.ttl_help
+  translation: "Une durée au format Go, par exemple 24h ou 90m. Le jour n'est pas une unité, écrivez donc 720h plutôt que 30d. Laissez vide pour prendre la valeur par défaut du serveur."
+
+- id: tokens.create.actor_label
+  translation: "Acteur du jeton"
+
+- id: tokens.create.actor_talos
+  translation: "Talos"
+
+- id: tokens.create.actor_talos_help
+  translation: "Télécharger les images et scripts PXE générés, ainsi que les programmes d’installation et autres artefacts OCI générés."
+
+- id: tokens.create.actor_automation
+  translation: "Automatisation (Omni / Terraform)"
+
+- id: tokens.create.actor_automation_help
+  translation: "Créer et lire des schémas, télécharger les images générées, lire les rapports et émettre des jetons limités pour Talos ou l’automatisation."
+
+- id: tokens.create.actor_operator
+  translation: "Opérateur"
+
+- id: tokens.create.actor_operator_help
+  translation: "Exploiter les images, les schémas, les proxys de sources et les rapports. Ne peut pas gérer les jetons."
+
+- id: tokens.create.actor_admin
+  translation: "Administrateur"
+
+- id: tokens.create.actor_admin_help
+  translation: "Accès opérateur, plus émission, consultation et révocation des jetons. Peut émettre tout profil d’acteur."
+
+- id: tokens.create.actor_required
+  translation: "Sélectionnez un acteur du jeton."
+
+- id: tokens.create.button
+  translation: "Créer un jeton"
+
+- id: tokens.create.cancel
+  translation: "Annuler"
+
+- id: tokens.secret.title
+  translation: "Jeton créé"
+
+- id: tokens.secret.warning
+  translation: "Ce secret ne s'affiche qu'une seule fois. Copiez-le maintenant, car vous ne pourrez plus le consulter ensuite."
+
+- id: tokens.secret.identity
+  translation: "Identité"
+
+- id: tokens.secret.token
+  translation: "Jeton"
+
+- id: tokens.secret.patch
+  translation: "Patch de configuration machine"
+
+- id: tokens.secret.close
+  translation: "Fermer"
+
+- id: tokens.revoke.button
+  translation: "Révoquer"
+
+- id: tokens.revoke.title
+  translation: "Révoquer le jeton"
+
+- id: tokens.revoke.confirm
+  translation: "Révoquer ce jeton ? Tout client ou nœud qui l'utilise perdra immédiatement l'accès."
+
+- id: tokens.error.load
+  translation: "Échec du chargement des jetons"
+
+- id: tokens.error.revoke
+  translation: "Échec de la révocation du jeton"
+
+- id: tokens.error.limit
+  translation: "Limite de jetons atteinte pour cette identité"

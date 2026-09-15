@@ -15,11 +15,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/blang/semver/v4"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -35,7 +39,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/siderolabs/image-factory/cmd/image-factory/cmd"
+	registryhttp "github.com/siderolabs/image-factory/internal/frontend/http"
+	"github.com/siderolabs/image-factory/internal/image/attestation"
+	"github.com/siderolabs/image-factory/internal/image/verify"
 	"github.com/siderolabs/image-factory/pkg/client"
+	"github.com/siderolabs/image-factory/pkg/enterprise"
 	"github.com/siderolabs/image-factory/pkg/schematic"
 )
 
@@ -53,12 +62,7 @@ func ociRemoteAuthOpts() []remote.Option {
 	}
 }
 
-func testInstallerImage(ctx context.Context, t *testing.T, registry name.Registry, talosVersion, schematic string, secureboot bool, platform v1.Platform, baseURL string, overlay bool) {
-	imageName := "installer"
-	if secureboot {
-		imageName += "-secureboot"
-	}
-
+func testInstallerImage(ctx context.Context, t *testing.T, registry name.Registry, imageName, talosVersion, schematic string, secureboot bool, platform v1.Platform, baseURL string, overlay, proxied bool) {
 	ref := registry.Repo(imageName, schematic).Tag(talosVersion)
 
 	q := quirks.New(talosVersion)
@@ -127,8 +131,34 @@ func testInstallerImage(ctx context.Context, t *testing.T, registry name.Registr
 
 	assertImageContainsFiles(t, img, expectedFiles)
 
+	if proxied {
+		assertProxiedImageSignature(ctx, t, ref.Context().Digest(descriptor.Digest.String()))
+
+		return
+	}
+
 	// verify the image signature
 	assertImageSignature(ctx, t, ref, baseURL)
+
+	if enterprise.Enabled() && registryhttp.InstallerEvidenceSupported(semver.MustParse(strings.TrimPrefix(talosVersion, "v"))) {
+		var platformDescriptor *v1.Descriptor
+		for i := range manifest.Manifests {
+			if manifest.Manifests[i].Platform != nil && manifest.Manifests[i].Platform.Equals(platform) {
+				platformDescriptor = &manifest.Manifests[i]
+
+				break
+			}
+		}
+		require.NotNil(t, platformDescriptor)
+
+		assertInstallerAttestations(
+			ctx,
+			t,
+			ref.Context().Digest(descriptor.Digest.String()),
+			ref.Context().Digest(platformDescriptor.Digest.String()),
+			baseURL,
+		)
+	}
 
 	// try to get the image once again, it should be fast now, as the image got cached & signed
 	start := time.Now()
@@ -137,6 +167,44 @@ func testInstallerImage(ctx context.Context, t *testing.T, registry name.Registr
 	require.NoError(t, err)
 
 	assert.Less(t, time.Since(start), 1*time.Second)
+}
+
+func testInstallerBaseImage(ctx context.Context, t *testing.T, registry name.Registry, imageName, talosVersion string, platform v1.Platform) {
+	ref := registry.Repo(imageName).Tag(talosVersion)
+
+	_, err := remote.Head(ref, ociRemoteAuthOpts()...)
+	require.NoError(t, err)
+
+	descriptor, err := remote.Get(ref, append(ociRemoteAuthOpts(), remote.WithPlatform(platform))...)
+	require.NoError(t, err)
+
+	index, err := descriptor.ImageIndex()
+	require.NoError(t, err)
+
+	manifest, err := index.IndexManifest()
+	require.NoError(t, err)
+
+	platforms := xslices.Map(
+		xslices.Filter(manifest.Manifests, func(m v1.Descriptor) bool {
+			// Ignore BuildKit attestation manifests (published with platform unknown/unknown).
+			return m.Annotations["vnd.docker.reference.type"] != "attestation-manifest"
+		}),
+		func(m v1.Descriptor) string { return m.Platform.String() },
+	)
+
+	sort.Strings(platforms)
+
+	assert.Equal(t, []string{"linux/amd64", "linux/arm64"}, platforms)
+
+	img, err := descriptor.Image()
+	require.NoError(t, err)
+
+	layers, err := img.Layers()
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, layers)
+
+	assertProxiedImageSignature(ctx, t, ref.Context().Digest(descriptor.Digest.String()))
 }
 
 func assertImageContainsFiles(t *testing.T, img v1.Image, files map[string]struct{}) {
@@ -225,7 +293,94 @@ func assertImageSignature(ctx context.Context, t *testing.T, ref name.Reference,
 	assert.NoError(t, err)
 }
 
-func testLatestTagResolution(ctx context.Context, t *testing.T, registryAddr string, baseURL string) {
+func assertInstallerAttestations(ctx context.Context, t *testing.T, indexRef, platformRef name.Digest, baseURL string) {
+	t.Helper()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/oci/cosign/signing-key.pub", nil)
+	require.NoError(t, err)
+	addTestAuth(request)
+
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close() //nolint:errcheck
+	require.Equal(t, http.StatusOK, response.StatusCode)
+
+	publicKey, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	publicKeyPath := filepath.Join(t.TempDir(), "cosign.pub")
+	require.NoError(t, os.WriteFile(publicKeyPath, publicKey, 0o600))
+
+	for _, expected := range []struct {
+		name          string
+		predicateType string
+		reference     name.Digest
+	}{
+		{name: "platform SPDX", predicateType: attestation.SPDXPredicateType, reference: platformRef},
+		{name: "index SLSA provenance", predicateType: attestation.SLSAProvenancePredicateType, reference: indexRef},
+	} {
+		t.Run(expected.name, func(t *testing.T) {
+			args := []string{
+				"verify-attestation",
+				"--key", publicKeyPath,
+				"--type", expected.predicateType,
+				"--insecure-ignore-tlog",
+				"--allow-http-registry",
+				"--allow-insecure-registry",
+			}
+
+			if username, password := authCredentials(); username != "" {
+				args = append(
+					args,
+					"--registry-username", username,
+					"--registry-password", password,
+				)
+			}
+
+			args = append(args, expected.reference.String())
+
+			command := exec.CommandContext(ctx, cosignPath, args...)
+
+			output, err := command.CombinedOutput()
+			require.NoErrorf(t, err, "cosign verify-attestation failed for %s:\n%s", expected.reference, output)
+			require.NotEmpty(t, output)
+		})
+	}
+}
+
+// assertProxiedImageSignature verifies that a proxied image's siderolabs signature
+// can be fetched and validated through the proxy. Unlike assertImageSignature.
+// Check against siderolabs' keyless (Google OIDC) signing identity rather than the
+// factory's per-run cache key, since proxied images are forwarded unmodified.
+func assertProxiedImageSignature(ctx context.Context, t *testing.T, digestRef name.Reference) {
+	t.Helper()
+
+	trustedRoot, err := cosign.TrustedRoot()
+	require.NoError(t, err)
+
+	var registryClientOpts []ociremote.Option
+	if opts := ociRemoteAuthOpts(); len(opts) > 0 {
+		registryClientOpts = append(registryClientOpts, ociremote.WithRemoteOptions(opts...))
+	}
+
+	result, err := verify.VerifySignatures(ctx, digestRef, verify.VerifyOptions{
+		CheckOpts: []cosign.CheckOpts{
+			{
+				TrustedMaterial:    trustedRoot,
+				RegistryClientOpts: registryClientOpts,
+				Identities: []cosign.Identity{
+					{
+						Issuer:        "https://accounts.google.com",
+						SubjectRegExp: `(@siderolabs\.com$|^releasemgr-svc@talos-production\.iam\.gserviceaccount\.com$)`,
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.Verified)
+}
+
+func testLatestTagResolution(t *testing.T, registryAddr string) {
 	registry, err := name.NewRegistry(registryAddr)
 	require.NoError(t, err)
 
@@ -249,6 +404,103 @@ func testLatestTagResolution(ctx context.Context, t *testing.T, registryAddr str
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, layers, "latest tag should resolve to a valid installer image with layers")
+}
+
+func testRegistryProxy(ctx context.Context, t *testing.T, registryAddr string, baseURL string) {
+	talosVersion := "v1.13.5"
+
+	registry, err := name.NewRegistry(registryAddr)
+	require.NoError(t, err)
+
+	t.Run("PullAndVerifySignature", func(t *testing.T) {
+		t.Parallel()
+
+		for _, platform := range []v1.Platform{
+			{
+				Architecture: "amd64",
+				OS:           "linux",
+			},
+			{
+				Architecture: "arm64",
+				OS:           "linux",
+			},
+		} {
+			t.Run(platform.String(), func(t *testing.T) {
+				t.Parallel()
+
+				testInstallerBaseImage(ctx, t, registry, "siderolabs/installer-base", talosVersion, platform)
+			})
+		}
+	})
+
+	t.Run("ListTags", func(t *testing.T) {
+		t.Parallel()
+
+		for _, image := range cmd.DefaultOptions.Artifacts.Core.Components.ImageMap() {
+			repo := registry.Repo(image)
+
+			tags, err := remote.List(repo, ociRemoteAuthOpts()...)
+			require.NoError(t, err)
+
+			assert.NotEmpty(t, tags, talosVersion)
+		}
+	})
+
+	t.Run("Authentication", func(t *testing.T) {
+		if !enterprise.Enabled() {
+			t.Skip()
+		}
+
+		repo := registry.Repo("siderolabs", "installer-base")
+
+		// No ociRemoteAuthOpts provided: expect error
+		_, err := remote.List(repo)
+		require.ErrorContains(t, err, "Unauthorized")
+	})
+
+	t.Run("RejectsUnknownImagesAndPaths", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name           string
+			path           string
+			expectedStatus int
+		}{
+			{
+				name:           "unknown proxied image",
+				path:           "/v2/siderolabs/nonexistent/manifests/" + talosVersion,
+				expectedStatus: http.StatusNotFound,
+			},
+			{
+				name:           "unregistered path shape",
+				path:           "/v2/a/b/c/manifests/v1",
+				expectedStatus: http.StatusNotFound,
+			},
+			{
+				name:           "tags resource without list reference",
+				path:           "/v2/siderolabs/installer/tags/v1",
+				expectedStatus: http.StatusNotFound,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+tc.path, nil)
+				require.NoError(t, err)
+
+				addTestAuth(req)
+
+				resp, err := http.DefaultClient.Do(req)
+				require.NoError(t, err)
+
+				t.Cleanup(func() {
+					resp.Body.Close()
+				})
+
+				assert.Equal(t, tc.expectedStatus, resp.StatusCode)
+			})
+		}
+	})
 }
 
 func testRegistryFrontend(ctx context.Context, t *testing.T, registryAddr string, baseURL string) {
@@ -311,7 +563,12 @@ func testRegistryFrontend(ctx context.Context, t *testing.T, registryAddr string
 								t.Run(platform.String(), func(t *testing.T) {
 									t.Parallel()
 
-									testInstallerImage(ctx, t, registry, talosVersion, schematicID, secureboot, platform, baseURL, false)
+									imageName := "installer"
+									if secureboot {
+										imageName += "-secureboot"
+									}
+
+									testInstallerImage(ctx, t, registry, imageName, talosVersion, schematicID, secureboot, platform, baseURL, false, false)
 								})
 							}
 						})
@@ -349,7 +606,7 @@ func testRegistryFrontend(ctx context.Context, t *testing.T, registryAddr string
 					t.Run(platform.String(), func(t *testing.T) {
 						t.Parallel()
 
-						testInstallerImage(ctx, t, registry, talosVersion, schematicID, false, platform, baseURL, true)
+						testInstallerImage(ctx, t, registry, "installer", talosVersion, schematicID, false, platform, baseURL, true, false)
 					})
 				}
 			})

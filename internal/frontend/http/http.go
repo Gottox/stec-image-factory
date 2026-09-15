@@ -12,8 +12,10 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/getkin/kin-openapi/routers"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/uuid"
@@ -29,6 +31,8 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/siderolabs/image-factory/api"
+	"github.com/siderolabs/image-factory/internal/apitoken"
 	"github.com/siderolabs/image-factory/internal/artifacts"
 	"github.com/siderolabs/image-factory/internal/asset"
 	"github.com/siderolabs/image-factory/internal/audit"
@@ -48,15 +52,18 @@ import (
 // Frontend is the HTTP frontend.
 type Frontend struct {
 	router            *httprouter.Router
+	contract          *api.Contract
 	schematicFactory  *schematic.Factory
 	assetBuilder      *asset.Builder
 	artifactsManager  *artifacts.Manager
 	secureBootService *secureboot.Service
 	checksummer       enterprise.Checksummer
+	signatureWriter   enterprise.SignatureWriter
 	logger            *zap.Logger
 	puller            remotewrap.Puller
 	pusher            remotewrap.Pusher
 	imageSigner       signer.Signer
+	evidencePublisher enterprise.InstallerEvidencePublisher
 	readinessCheckers []enterprise.ReadinessChecker
 	sf                singleflight.Group
 	options           Options
@@ -64,12 +71,17 @@ type Frontend struct {
 
 // Options configures the HTTP frontend.
 type Options struct {
-	CacheImageSigner                 signer.Signer
+	ImageProxy          ImageProxyOptions
+	CacheImageSigner    signer.Signer
+	InstallerSBOMSource enterprise.SPDXSource
+	AuthProvider        enterprise.AuthProvider
+	TokenVerifier       enterprise.TokenVerifier
+
 	ExternalURL                      *url.URL
 	ExternalPXEURL                   *url.URL
-	AuthProvider                     enterprise.AuthProvider
 	AuditSink                        audit.Sink
 	InstallerInternalRepository      name.Repository
+	InstallerInternalNameOptions     []name.Option
 	InstallerExternalRepository      name.Repository
 	MetricsNamespace                 string
 	AllowedOrigins                   []string
@@ -78,17 +90,28 @@ type Options struct {
 	ProxyInstallerInternalRepository bool
 }
 
+type ImageProxyOptions struct {
+	Images          map[string]string
+	BackingRegistry name.Registry
+	Namespace       string
+}
+
 // Handler is a custom handler type that includes the context and httprouter params, and returns an error.
 type Handler = func(ctx context.Context, w http.ResponseWriter, r *http.Request, p httprouter.Params) error
 
+// InvalidRequestTag marks requests rejected by the OpenAPI contract.
+type InvalidRequestTag struct{}
+
 // NewFrontend creates a new HTTP frontend.
 func NewFrontend(
+	ctx context.Context,
 	logger *zap.Logger,
 	schematicFactory *schematic.Factory,
 	assetBuilder *asset.Builder,
 	artifactsManager *artifacts.Manager,
 	secureBootService *secureboot.Service,
 	checksummer enterprise.Checksummer,
+	signatureWriter enterprise.SignatureWriter,
 	enterprisePlugins []enterprise.FrontendPlugin,
 	opts Options,
 ) (*Frontend, error) {
@@ -99,6 +122,7 @@ func NewFrontend(
 		artifactsManager:  artifactsManager,
 		secureBootService: secureBootService,
 		checksummer:       checksummer,
+		signatureWriter:   signatureWriter,
 		logger:            logger.With(zap.String("frontend", "http")),
 		options:           opts,
 	}
@@ -111,17 +135,33 @@ func NewFrontend(
 
 	var err error
 
-	frontend.puller, err = remotewrap.NewPuller(opts.RegistryRefreshInterval, opts.RemoteOptions...)
+	frontend.contract, err = api.NewContract(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OpenAPI contract: %w", err)
+	}
+
+	frontend.puller, err = remotewrap.NewPuller(opts.RegistryRefreshInterval, opts.InstallerInternalNameOptions, opts.RemoteOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create puller: %w", err)
 	}
 
-	frontend.pusher, err = remotewrap.NewPusher(opts.RegistryRefreshInterval, opts.RemoteOptions...)
+	frontend.pusher, err = remotewrap.NewPusher(opts.RegistryRefreshInterval, opts.InstallerInternalNameOptions, opts.RemoteOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pusher: %w", err)
 	}
 
 	frontend.imageSigner = opts.CacheImageSigner
+
+	frontend.evidencePublisher, err = enterprise.NewInstallerEvidencePublisher(
+		frontend.logger,
+		frontend.imageSigner,
+		opts.InstallerSBOMSource,
+		frontend.pusher,
+		frontend.puller,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Installer evidence publisher: %w", err)
+	}
 
 	// monitoring middleware
 	mdlw := middleware.New(middleware.Config{
@@ -130,89 +170,139 @@ func NewFrontend(
 		}),
 	})
 
-	registerRoute := func(registrator func(string, httprouter.Handle), path string, handler Handler) {
-		registrator(path, httproutermiddleware.Handler(path, frontend.wrapper(handler), mdlw))
+	var registrationErr error
+
+	registerRoute := func(method string, registrator func(string, httprouter.Handle), path string, handler Handler) {
+		handle := httproutermiddleware.Handler(path, frontend.wrapper(handler), mdlw)
+		if routeErr := registerRuntimeRoute(frontend.contract, method, registrator, path, handle); routeErr != nil {
+			registrationErr = errors.Join(registrationErr, routeErr)
+		}
 	}
 
-	registerPublicRoute := func(registrator func(string, httprouter.Handle), path string, handler Handler) {
-		registrator(path, httproutermiddleware.Handler(path, frontend.wrapperPublic(handler), mdlw))
+	registerPublicRoute := func(method string, registrator func(string, httprouter.Handle), path string, handler Handler) {
+		handle := httproutermiddleware.Handler(path, frontend.wrapperPublic(handler), mdlw)
+		if routeErr := registerRuntimeRoute(frontend.contract, method, registrator, path, handle); routeErr != nil {
+			registrationErr = errors.Join(registrationErr, routeErr)
+		}
+	}
+
+	registerStaticRoute := func(path string, filesystem http.FileSystem) {
+		if routeErr := registerRuntimeRoute(frontend.contract, http.MethodGet, frontend.router.GET, path, serveFiles(filesystem)); routeErr != nil {
+			registrationErr = errors.Join(registrationErr, routeErr)
+		}
 	}
 
 	// enterprise
 	for _, enterpriseRoute := range enterprisePlugins {
+		_, isPublic := enterpriseRoute.(enterprise.PublicRoute)
+
 		for _, method := range enterpriseRoute.Methods() {
+			var registrator func(string, httprouter.Handle)
+
 			switch method {
 			case http.MethodGet:
-				registerRoute(frontend.router.GET, enterpriseRoute.Path(), enterpriseRoute.Handle)
-
+				registrator = frontend.router.GET
 			case http.MethodHead:
-				registerRoute(frontend.router.HEAD, enterpriseRoute.Path(), enterpriseRoute.Handle)
-
+				registrator = frontend.router.HEAD
 			case http.MethodPost:
-				registerRoute(frontend.router.POST, enterpriseRoute.Path(), enterpriseRoute.Handle)
-
+				registrator = frontend.router.POST
 			default:
 				panic(fmt.Sprintf("unsupported method %s for enterprise route %s", method, enterpriseRoute.Path()))
+			}
+
+			if isPublic {
+				registerPublicRoute(method, registrator, enterpriseRoute.Path(), enterpriseRoute.Handle)
+			} else {
+				registerRoute(method, registrator, enterpriseRoute.Path(), enterpriseRoute.Handle)
 			}
 		}
 	}
 
 	// /healthz and /readyz are always public (Kubernetes probes, monitoring)
-	registerPublicRoute(frontend.router.GET, "/healthz", frontend.handleHealth)
-	registerPublicRoute(frontend.router.HEAD, "/healthz", frontend.handleHealth)
-	registerPublicRoute(frontend.router.GET, "/readyz", frontend.handleReady)
-	registerPublicRoute(frontend.router.HEAD, "/readyz", frontend.handleReady)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/healthz", frontend.handleHealth)
+	registerPublicRoute(http.MethodHead, frontend.router.HEAD, "/healthz", frontend.handleHealth)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/readyz", frontend.handleReady)
+	registerPublicRoute(http.MethodHead, frontend.router.HEAD, "/readyz", frontend.handleReady)
 
-	// images - require auth
-	registerRoute(frontend.router.GET, "/image/:schematic/:version/:path", frontend.handleImage)
-	registerRoute(frontend.router.HEAD, "/image/:schematic/:version/:path", frontend.handleImage)
+	// images - require auth (API tokens bypass auth via JWT verification)
+	registerRoute(http.MethodGet, frontend.router.GET, "/image/:schematic/:version/:path", frontend.handleImage)
+	registerRoute(http.MethodHead, frontend.router.HEAD, "/image/:schematic/:version/:path", frontend.handleImage)
 
 	// PXE - require auth
-	registerRoute(frontend.router.GET, "/pxe/:schematic/:version/:path", frontend.handlePXE)
+	registerRoute(http.MethodGet, frontend.router.GET, "/pxe/:schematic/:version/:path", frontend.handlePXE)
 
 	// registry - /v2 requires auth (OCI spec: 401 challenge when auth enabled)
-	registerRoute(frontend.router.GET, "/v2", frontend.handleHealth)
-	registerRoute(frontend.router.GET, "/v2/", frontend.handleHealth)
-	registerRoute(frontend.router.HEAD, "/v2", frontend.handleHealth)
-	registerRoute(frontend.router.HEAD, "/v2/", frontend.handleHealth)
-	registerRoute(frontend.router.GET, "/v2/:image/:schematic/blobs/:digest", frontend.handleBlob)
-	registerRoute(frontend.router.HEAD, "/v2/:image/:schematic/blobs/:digest", frontend.handleBlob)
-	registerRoute(frontend.router.GET, "/v2/:image/:schematic/manifests/:tag", frontend.handleManifest)
-	registerRoute(frontend.router.HEAD, "/v2/:image/:schematic/manifests/:tag", frontend.handleManifest)
-	registerPublicRoute(frontend.router.GET, "/oci/cosign/signing-key.pub", frontend.handleCosignSigningKeyPub)
+	registerRoute(http.MethodGet, frontend.router.GET, "/v2", frontend.handleHealth)
+	registerRoute(http.MethodHead, frontend.router.HEAD, "/v2", frontend.handleHealth)
+	registerRoute(http.MethodGet, frontend.router.GET, "/v2/*path", frontend.handleV2)
+	registerRoute(http.MethodHead, frontend.router.HEAD, "/v2/*path", frontend.handleV2)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/oci/cosign/signing-key.pub", frontend.handleCosignSigningKeyPub)
 
 	// schematic - both POST and GET require auth
-	registerRoute(frontend.router.POST, "/schematics", frontend.handleSchematicCreate)
-	registerRoute(frontend.router.GET, "/schematics/:schematic", frontend.handleSchematicGet)
+	registerRoute(http.MethodPost, frontend.router.POST, "/schematics", frontend.handleSchematicCreate)
+	registerRoute(http.MethodGet, frontend.router.GET, "/schematics/:schematic", frontend.handleSchematicGet)
 
 	// meta - public
-	registerPublicRoute(frontend.router.GET, "/versions", frontend.handleVersions)
-	registerPublicRoute(frontend.router.GET, "/version/:version/extensions/official", frontend.handleOfficialExtensions)
-	registerPublicRoute(frontend.router.GET, "/version/:version/overlays/official", frontend.handleOfficialOverlays)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/versions", frontend.handleVersions)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/version/:version/extensions/official", frontend.handleOfficialExtensions)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/version/:version/overlays/official", frontend.handleOfficialOverlays)
 
 	// secureboot - public
-	registerPublicRoute(frontend.router.GET, "/secureboot/signing-cert.pem", frontend.handleSecureBootSigningCert)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/secureboot/signing-cert.pem", frontend.handleSecureBootSigningCert)
 
 	// talosctl - public
-	registerPublicRoute(frontend.router.GET, "/talosctl/:version", frontend.handleTalosctlList)
-	registerPublicRoute(frontend.router.HEAD, "/talosctl/:version/:path", frontend.handleTalosctl)
-	registerPublicRoute(frontend.router.GET, "/talosctl/:version/:path", frontend.handleTalosctl)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/talosctl/:version", frontend.handleTalosctlList)
+	registerPublicRoute(http.MethodHead, frontend.router.HEAD, "/talosctl/:version/:path", frontend.handleTalosctl)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/talosctl/:version/:path", frontend.handleTalosctl)
 
-	// llms.txt - public
-	registerPublicRoute(frontend.router.GET, "/llms.txt", frontend.handleLLMsTxt)
+	// machine-readable API documentation - public
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/llms.txt", frontend.handleLLMsTxt)
+	registerPublicRoute(http.MethodGet, frontend.router.GET, "/openapi.yaml", frontend.handleOpenAPI)
 
 	// UI - require auth (consistent with all other schematic-creating endpoints)
-	registerRoute(frontend.router.GET, "/", frontend.handleUI)
-	registerRoute(frontend.router.HEAD, "/", frontend.handleUI)
-	registerRoute(frontend.router.POST, "/ui/wizard", frontend.handleUIWizard)
-	registerRoute(frontend.router.GET, "/ui/version-doc", frontend.handleUIVersionDoc)
-	registerRoute(frontend.router.POST, "/ui/extensions-list", frontend.handleUIExtensionsList)
+	registerRoute(http.MethodGet, frontend.router.GET, "/", frontend.handleUI)
+	registerRoute(http.MethodHead, frontend.router.HEAD, "/", frontend.handleUI)
+	registerRoute(http.MethodPost, frontend.router.POST, "/ui/wizard", frontend.handleUIWizard)
+	registerRoute(http.MethodGet, frontend.router.GET, "/ui/version-doc", frontend.handleUIVersionDoc)
+	registerRoute(http.MethodPost, frontend.router.POST, "/ui/extensions-list", frontend.handleUIExtensionsList)
+	registerRoute(http.MethodGet, frontend.router.GET, "/ui/tokens", frontend.handleTokensUI)
 
-	frontend.router.ServeFiles("/css/*filepath", http.FS(ensure.Value(fs.Sub(cssFS, "css"))))
-	frontend.router.ServeFiles("/favicons/*filepath", http.FS(ensure.Value(fs.Sub(faviconsFS, "favicons"))))
-	frontend.router.ServeFiles("/js/*filepath", http.FS(ensure.Value(fs.Sub(jsFS, "js"))))
+	registerStaticRoute("/css/*filepath", http.FS(ensure.Value(fs.Sub(cssFS, "css"))))
+	registerStaticRoute("/favicons/*filepath", http.FS(ensure.Value(fs.Sub(faviconsFS, "favicons"))))
+	registerStaticRoute("/js/*filepath", http.FS(ensure.Value(fs.Sub(jsFS, "js"))))
+
+	frontend.registerBrowserLogin(registerPublicRoute)
+
+	if registrationErr != nil {
+		return nil, fmt.Errorf("register HTTP routes: %w", registrationErr)
+	}
 
 	return frontend, nil
+}
+
+func registerRuntimeRoute(
+	contract *api.Contract,
+	method string,
+	registrator func(string, httprouter.Handle),
+	path string,
+	handle httprouter.Handle,
+) error {
+	if err := contract.ValidateRuntimeRoute(method, path); err != nil {
+		return err
+	}
+
+	registrator(path, handle)
+
+	return nil
+}
+
+func serveFiles(filesystem http.FileSystem) httprouter.Handle {
+	server := http.FileServer(filesystem)
+
+	return func(writer http.ResponseWriter, request *http.Request, params httprouter.Params) {
+		request.URL.Path = params.ByName("filepath")
+		server.ServeHTTP(writer, request)
+	}
 }
 
 // Handler returns the HTTP handler.
@@ -243,24 +333,45 @@ func (f *Frontend) wrapHandler(h Handler, requireAuth bool) httprouter.Handle {
 		ctx := ctxlog.WithRequestID(r.Context(), requestID)
 		logger := ctxlog.Logger(ctx, f.logger)
 
-		w.Header().Set("Server", version.ServerString())
-		w.Header().Set(RequestIDHeader, requestID)
+		var state responseState
+
+		sw := wrapResponseWriter(w, &state)
+
+		sw.Header().Set("Server", version.ServerString())
+		sw.Header().Set(RequestIDHeader, requestID)
 
 		var username string
 
-		handler := f.withAuth(h, requireAuth, &username)
+		handler := f.withAuth(f.withContractValidation(h), requireAuth, &username, &state)
 
 		start := time.Now()
-		err := handler(ctx, w, r, p)
+		err := handler(ctx, sw, r, p)
 		duration := time.Since(start)
 
 		level, status := MatchError(err, func(message string, code int) {
-			if code == http.StatusUnauthorized {
-				w.Header().Set("WWW-Authenticate", `Basic realm="Image Factory Enterprise"`)
+			if state.status != 0 {
+				// The handler already responded; this error is only here to be logged.
+				return
 			}
 
-			http.Error(w, message, code)
+			if code == http.StatusUnauthorized {
+				// Fallback only: a provider that picked its own challenges keeps them, and one
+				// redirecting htmx wants none — a challenge pops the browser's Basic dialog.
+				if sw.Header().Get("WWW-Authenticate") == "" && sw.Header().Get("Hx-Redirect") == "" {
+					sw.Header().Set("WWW-Authenticate", `Basic realm="Image Factory Enterprise", charset="UTF-8"`)
+				}
+			}
+
+			http.Error(sw, message, code)
 		})
+
+		// A handler that answered for itself returns nil, which would log as a 200.
+		if state.status != 0 {
+			status = state.status
+		} else {
+			// Nothing was committed, so net/http sends an implicit 200 that reaches no hook.
+			state.applyCacheControlPin(sw)
+		}
 
 		logger.Log(
 			level, "request",
@@ -287,6 +398,27 @@ func (f *Frontend) wrapHandler(h Handler, requireAuth bool) httprouter.Handle {
 	}
 }
 
+func (f *Frontend) withContractValidation(h Handler) Handler {
+	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
+		if f.contract != nil {
+			_, _, err := f.contract.ValidateRequest(ctx, r)
+			if errors.Is(err, routers.ErrPathNotFound) {
+				return xerrors.NewTagged[RouteNotFoundTag](fmt.Errorf("route not registered in OpenAPI: %w", err))
+			}
+
+			if errors.Is(err, routers.ErrMethodNotAllowed) {
+				return xerrors.NewTagged[MethodNotAllowedTag](fmt.Errorf("method not registered in OpenAPI: %w", err))
+			}
+
+			if err != nil {
+				return xerrors.NewTagged[InvalidRequestTag](fmt.Errorf("invalid request: %w", err))
+			}
+		}
+
+		return h(ctx, w, r, p)
+	}
+}
+
 // requestIDFrom returns the incoming request ID, or a freshly generated one.
 func requestIDFrom(r *http.Request) string {
 	if id := r.Header.Get(RequestIDHeader); id != "" {
@@ -296,23 +428,124 @@ func requestIDFrom(r *http.Request) string {
 	return uuid.NewString()
 }
 
+// downloadTokenKey keys the verified URL-safe API token on the request context.
+type downloadTokenKey struct{}
+
+// downloadTokenFromContext returns the URL-safe API token that authenticated the request.
+// It is only ever set after Verify succeeded, so a caller may forward it as-is.
+func downloadTokenFromContext(ctx context.Context) (string, bool) {
+	token, ok := ctx.Value(downloadTokenKey{}).(string)
+
+	return token, ok
+}
+
 // withAuth wraps h with the auth middleware when authentication is required.
 //
 // The middleware stores the username on a context it derives internally, which
 // never reaches wrapHandler's context; a thin capture layer reads it from inside
 // the middleware call stack and writes it to username.
-func (f *Frontend) withAuth(h Handler, requireAuth bool, username *string) Handler {
+func (f *Frontend) withAuth(h Handler, requireAuth bool, username *string, state *responseState) Handler {
 	if !requireAuth || f.options.AuthProvider == nil {
 		return h
 	}
 
 	authProvider := f.options.AuthProvider
 
-	return authProvider.Middleware(func(ctx context.Context, w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
-		*username, _ = authProvider.UsernameFromContext(ctx)
+	return func(ctx context.Context, w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
+		// API token: the JWT subject becomes the authenticated identity, so ownership is then
+		// enforced normally by schematicFactory.Get(). A URL-safe token is also put on the
+		// context, for handlePXE to forward into the asset URLs it emits.
+		if f.options.TokenVerifier != nil {
+			if tokenStr, fromQuery := extractAPIToken(r); tokenStr != "" {
+				// Verify logs its own rejection reasons; the two checks below are this layer's,
+				// and are logged here so an authorization failure is never mistaken for the
+				// credential failure the fallback provider goes on to report.
+				if claims, ok := f.options.TokenVerifier.Verify(ctx, tokenStr); ok {
+					switch {
+					case !apitoken.Allows(claims.Scopes, r.Method, r.URL.Path):
+						ctxlog.Logger(ctx, f.logger).Warn(
+							"API token scopes do not cover this request",
+							zap.String("sub", claims.Subject),
+							zap.String("jti", claims.ID),
+							zap.Strings("scopes", claims.Scopes),
+						)
+					case fromQuery && !apitoken.URLSafe(claims.Scopes):
+						ctxlog.Logger(ctx, f.logger).Warn(
+							"API token may not travel in a query string",
+							zap.String("sub", claims.Subject),
+							zap.String("jti", claims.ID),
+							zap.Strings("scopes", claims.Scopes),
+						)
+					default:
+						*username = claims.Subject
+						ctx = authProvider.ContextWithUsername(ctx, claims.Subject)
 
-		return h(ctx, w, r, p)
-	})
+						ctx = apitoken.ContextWithClaims(ctx, claims)
+
+						if apitoken.URLSafe(claims.Scopes) {
+							ctx = context.WithValue(ctx, downloadTokenKey{}, tokenStr)
+						}
+
+						return h(ctx, w, r, p)
+					}
+				}
+			}
+		}
+
+		err := authProvider.Middleware(func(ctx context.Context, w http.ResponseWriter, r *http.Request, p httprouter.Params) error {
+			*username, _ = authProvider.UsernameFromContext(ctx)
+
+			// The provider has decided by now, so pin the Cache-Control it chose.
+			state.pinCacheControl(w)
+
+			return h(ctx, w, r, p)
+		})(ctx, w, r, p)
+
+		// A provider can authenticate the caller and then refuse the request, in which case
+		// the layer above never ran. The provider leaves the principal on the request so the
+		// denial is still attributable.
+		if *username == "" {
+			*username, _ = authProvider.UsernameFromContext(r.Context()) //nolint:contextcheck // the provider derived this context from ctx
+		}
+
+		return err
+	}
+}
+
+// extractAPIToken pulls an API token off the request, reporting whether it came from the
+// query string, which the caller pairs with apitoken.URLSafe.
+//
+// A token that arrives in a query string has already been written to whatever access logs sit in
+// front of the factory, and refusing it un-leaks nothing; the operator took that risk knowingly,
+// and a stored token is the better credential to have taken it with, being both revocable and
+// expiring. A minting credential is the exception URLSafe encodes: leaking one yields more
+// credentials rather than just itself, and no PXE flow needs one.
+func extractAPIToken(r *http.Request) (token string, fromQuery bool) {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if token = r.URL.Query().Get("token"); token != "" {
+			return token, true
+		}
+	}
+
+	return extractBearerOrBasicToken(r), false
+}
+
+// extractBearerOrBasicToken pulls a bearer credential from the Authorization header, checking
+// both the Bearer scheme and HTTP Basic auth, since OCI/registry clients commonly send a token
+// as the Basic password rather than a Bearer header.
+func extractBearerOrBasicToken(r *http.Request) string {
+	scheme, value, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+
+	// RFC 9110 makes the scheme case-insensitive; some clients send "bearer".
+	if strings.EqualFold(scheme, "Bearer") {
+		return value
+	}
+
+	if _, password, ok := r.BasicAuth(); ok {
+		return password
+	}
+
+	return ""
 }
 
 // audit records one entry for an authenticated request; a sink failure is logged
@@ -338,6 +571,9 @@ func errString(err error) string {
 
 // MatchError matches the error and returns the appropriate HTTP status code and log level.
 // It also calls the callback with the message and code to write the response.
+//
+// enterrors.RespondedTag is the exception: no callback, and the status is a placeholder that
+// callers replace with the one on the response writer.
 func MatchError(err error, callback func(message string, code int)) (zapcore.Level, int) {
 	status := http.StatusOK
 	level := zap.InfoLevel
@@ -345,6 +581,8 @@ func MatchError(err error, callback func(message string, code int)) (zapcore.Lev
 	switch {
 	case err == nil:
 		// happy case
+	case xerrors.TagIs[enterrors.RespondedTag](err):
+		level = zap.WarnLevel
 	case xerrors.TagIs[enterrors.NotEnabledTag](err):
 		level = zap.WarnLevel
 		status = http.StatusPaymentRequired
@@ -355,16 +593,28 @@ func MatchError(err error, callback func(message string, code int)) (zapcore.Lev
 		status = http.StatusServiceUnavailable
 
 		callback("service temporarily unavailable", http.StatusServiceUnavailable)
+	case xerrors.TagIs[ProxyUnavailableTag](err):
+		level = zap.WarnLevel
+		status = http.StatusServiceUnavailable
+
+		callback(err.Error(), http.StatusServiceUnavailable)
 	case xerrors.TagIs[storage.ErrNotFoundTag](err),
-		xerrors.TagIs[artifacts.ErrNotFoundTag](err):
+		xerrors.TagIs[artifacts.ErrNotFoundTag](err),
+		xerrors.TagIs[RouteNotFoundTag](err):
 		level = zap.WarnLevel
 		status = http.StatusNotFound
 
 		callback(err.Error(), http.StatusNotFound)
+	case xerrors.TagIs[MethodNotAllowedTag](err):
+		level = zap.WarnLevel
+		status = http.StatusMethodNotAllowed
+
+		callback(err.Error(), http.StatusMethodNotAllowed)
 	case xerrors.TagIs[profile.InvalidErrorTag](err),
 		xerrors.TagIs[schematicpkg.InvalidErrorTag](err),
 		xerrors.TagIs[enterrors.InvalidErrorTag](err),
-		xerrors.TagIs[InvalidImageTag](err):
+		xerrors.TagIs[InvalidImageTag](err),
+		xerrors.TagIs[InvalidRequestTag](err):
 		level = zap.WarnLevel
 		status = http.StatusBadRequest
 

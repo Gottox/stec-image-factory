@@ -16,10 +16,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/anchore/clio"
+	"github.com/anchore/grype/grype"
 	"github.com/anchore/grype/grype/db/v6/distribution"
 	"github.com/anchore/grype/grype/db/v6/installation"
 	"github.com/anchore/grype/grype/presenter/models"
@@ -27,28 +29,43 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/siderolabs/gen/xerrors"
+	"github.com/siderolabs/go-vex/pkg/kernelversion"
 	govexscanner "github.com/siderolabs/go-vex/pkg/scanner"
 	"go.uber.org/zap"
 
 	"github.com/siderolabs/image-factory/enterprise/auth"
+	scanlogger "github.com/siderolabs/image-factory/enterprise/scanner/logger"
 	"github.com/siderolabs/image-factory/internal/artifacts"
 	"github.com/siderolabs/image-factory/internal/cache"
 	"github.com/siderolabs/image-factory/internal/ctxlog"
+	"github.com/siderolabs/image-factory/internal/schedule"
 	enterrors "github.com/siderolabs/image-factory/pkg/enterprise/errors"
 )
 
 // ErrNotReady is returned when the Grype DB has not finished initializing.
 var ErrNotReady = xerrors.NewTagged[enterrors.NotReadyTag](errors.New("scanner not ready"))
 
-// scannerID is the identifier embedded in scan reports.
-const scannerID = "image-factory"
+const (
+	// scannerID is the identifier embedded in scan reports.
+	scannerID = "image-factory"
+
+	// defaultDBRootDir is where the Grype vulnerability database is installed
+	// unless Options says otherwise. The Helm chart mounts a volume here, so with
+	// a persistent volume the DB (and therefore the scan results) survive a
+	// restart.
+	defaultDBRootDir = "/var/lib/grype"
+)
 
 // ScanTimeout caps a single end-to-end scan (SBOM fetch + VEX fetch + Grype match).
 const ScanTimeout = 15 * time.Minute
 
-// VEXSource produces a VEX JSON document for a given Talos version tag.
+// dbRefreshRetryInterval is how long to wait before retrying a failed scheduled
+// DB refresh.
+const dbRefreshRetryInterval = 5 * time.Minute
+
+// VEXSource produces VEX JSON documents for Talos targets.
 type VEXSource interface {
-	Build(ctx context.Context, versionTag string) ([]byte, error)
+	BuildForKernel(ctx context.Context, versionTag, kernelVersion string) ([]byte, error)
 }
 
 // SPDXSource produces a merged SPDX JSON document for a schematic+version+arch.
@@ -63,6 +80,8 @@ type Options struct {
 	VEXSource        VEXSource
 	SPDXSource       SPDXSource
 	DatabaseURL      string
+	DatabaseUpdateAt string
+	DatabaseRootDir  string
 	MetricsNamespace string
 	CacheTTL         time.Duration
 	Capacity         uint64
@@ -73,14 +92,27 @@ type Options struct {
 // rendered report is produced on-demand from the cached Document so that
 // switching formats does not retrigger a full scan.
 type Builder struct {
-	scanner    atomic.Pointer[govexscanner.Scanner]
-	initErr    atomic.Pointer[error]
-	initDone   chan struct{}
+	scanner  atomic.Pointer[govexscanner.Scanner]
+	initErr  atomic.Pointer[error]
+	initDone chan struct{}
+
+	// stop signals the DB refresh loop to exit, refreshDone is closed once it has.
+	stop        chan struct{}
+	refreshDone chan struct{}
+
 	vexSource  VEXSource
 	spdxSource SPDXSource
 	logger     *zap.Logger
 	c          *cache.Cache[string, cachedScan]
-	cacheTTL   time.Duration
+	metricDB   prometheus.Gauge
+
+	// dbMu is held for reading while a scan matches against the loaded DB, and
+	// for writing while the DB is swapped, so a scheduled update never closes
+	// the vulnerability provider from under an in-flight scan. The atomic
+	// pointer above stays for lock-free readiness checks.
+	dbMu sync.RWMutex
+
+	cacheTTL time.Duration
 }
 
 type cachedScan struct {
@@ -93,7 +125,18 @@ type cachedScan struct {
 // The Grype vulnerability database is loaded asynchronously so that startup is
 // not blocked by the multi-second DB warm-up. Until initialization completes,
 // Build returns ErrNotReady and Ready reports the in-progress state.
-func NewBuilder(logger *zap.Logger, opts Options) *Builder {
+//
+// When opts.DatabaseUpdateAt is set, the DB is refreshed daily at that time of
+// day (see refreshLoop) instead of only at start-up, so replicas started at
+// different times converge on the same DB build rather than each keeping the one
+// that was latest when it happened to boot — the reason the same report could
+// differ between pods.
+func NewBuilder(logger *zap.Logger, opts Options) (*Builder, error) {
+	updateAt, err := schedule.ParseTimeOfDay(opts.DatabaseUpdateAt)
+	if err != nil {
+		return nil, err
+	}
+
 	b := &Builder{
 		vexSource:  opts.VEXSource,
 		spdxSource: opts.SPDXSource,
@@ -104,34 +147,80 @@ func NewBuilder(logger *zap.Logger, opts Options) *Builder {
 			MetricsHelp:      "Number of vulnerability scan results in in-memory cache.",
 			Capacity:         opts.Capacity,
 		}),
-		logger:   logger.With(zap.String("component", "scanner-builder")),
-		initDone: make(chan struct{}),
+		metricDB: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: opts.MetricsNamespace,
+			Name:      "image_factory_scanner_db_built_timestamp_seconds",
+			Help:      "Build timestamp of the Grype vulnerability database currently loaded (0 if none).",
+		}),
+		logger:      logger.With(zap.String("component", "scanner-builder")),
+		initDone:    make(chan struct{}),
+		stop:        make(chan struct{}),
+		refreshDone: make(chan struct{}),
 	}
 
-	go b.initScanner(opts)
+	grype.SetLogger(scanlogger.New(logger.With(zap.String("component", "grype"))))
 
-	return b
+	go b.initScanner(opts)
+	go b.refreshLoop(opts, updateAt)
+
+	return b, nil
+}
+
+// dbConfig returns the Grype distribution and installation configuration.
+func dbConfig(opts Options) (distribution.Config, installation.Config) {
+	distConfig := distribution.DefaultConfig()
+	if opts.DatabaseURL != "" {
+		distConfig.LatestURL = opts.DatabaseURL
+	}
+
+	instConfig := installation.DefaultConfig(clio.Identification{Name: scannerID})
+
+	instConfig.DBRootDir = opts.DatabaseRootDir
+	if instConfig.DBRootDir == "" {
+		instConfig.DBRootDir = defaultDBRootDir
+	}
+
+	// We decide when to update, so drop Grype's own low-pass filter: it would
+	// silently skip a scheduled update that follows a start-up download too closely.
+	instConfig.UpdateCheckMaxFrequency = 0
+
+	return distConfig, instConfig
+}
+
+// loadDB loads the vulnerability database, updating it from the configured
+// distribution first. It returns the scanner and the build timestamp of the DB,
+// which is also what reports carry as descriptor.db.
+func loadDB(opts Options) (*govexscanner.Scanner, time.Time, error) {
+	distConfig, instConfig := dbConfig(opts)
+
+	sc, err := govexscanner.NewScanner(govexscanner.Options{
+		ID:           scannerID,
+		Distribution: &distConfig,
+		Installation: &instConfig,
+	})
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+
+	var built time.Time
+
+	if status := sc.DatabaseStatus().Status; status != nil {
+		built = status.Built
+	}
+
+	return sc, built, nil
 }
 
 func (b *Builder) initScanner(opts Options) {
 	defer close(b.initDone)
 
-	scannerOpts := govexscanner.Options{ID: scannerID}
+	b.logger.Info(
+		"initializing grype scanner",
+		zap.String("databaseURL", opts.DatabaseURL),
+		zap.String("updateAt", opts.DatabaseUpdateAt),
+	)
 
-	if opts.DatabaseURL != "" {
-		distConfig := distribution.DefaultConfig()
-		distConfig.LatestURL = opts.DatabaseURL
-
-		instConfig := installation.DefaultConfig(clio.Identification{Name: scannerID})
-		instConfig.DBRootDir = "/var/lib/grype"
-
-		scannerOpts.Distribution = &distConfig
-		scannerOpts.Installation = &instConfig
-	}
-
-	b.logger.Info("initializing grype scanner", zap.String("databaseURL", opts.DatabaseURL))
-
-	sc, err := govexscanner.NewScanner(scannerOpts)
+	sc, built, err := loadDB(opts)
 	if err != nil {
 		wrapped := fmt.Errorf("error initializing grype scanner: %w", err)
 		b.initErr.Store(&wrapped)
@@ -140,8 +229,134 @@ func (b *Builder) initScanner(opts Options) {
 		return
 	}
 
+	b.setScanner(sc, built)
+	b.logger.Info("grype scanner ready", zap.Time("dbBuilt", built))
+}
+
+// setScanner installs the initial scanner.
+func (b *Builder) setScanner(sc *govexscanner.Scanner, built time.Time) {
+	b.dbMu.Lock()
+	defer b.dbMu.Unlock()
+
 	b.scanner.Store(sc)
-	b.logger.Info("grype scanner ready")
+	b.metricDB.Set(float64(built.Unix()))
+}
+
+// refresh installs a newer vulnerability DB and reopens the scanner on it.
+func (b *Builder) refresh(opts Options) error {
+	// Download and install first, outside the lock: it is the slow part, and the
+	// currently loaded DB goes on serving scans while it runs.
+	if err := updateDB(opts); err != nil {
+		return err
+	}
+
+	b.dbMu.Lock()
+	defer b.dbMu.Unlock()
+
+	// Close the loaded DB before opening the new one. Grype hands a reader opened
+	// while another is still alive on the same directory the contents from before
+	// the update, so loading first and closing after installs the new DB on disk
+	// and then serves the old data from it indefinitely — the failure this
+	// ordering exists to prevent, covered by TestIntegrationScannerDBRotation.
+	if old := b.scanner.Swap(nil); old != nil {
+		if err := old.Close(); err != nil {
+			b.logger.Warn("error closing previous grype DB", zap.Error(err))
+		}
+	}
+
+	// Scans are blocked by the write lock until this returns. updateDB already
+	// installed the DB, so this only reopens it.
+	sc, built, err := loadDB(opts)
+	if err != nil {
+		// the scanner stays nil, so Ready reports not-ready and the caller retries
+		// rather than serving reports from a DB that is no longer on disk.
+		return err
+	}
+
+	b.scanner.Store(sc)
+	b.metricDB.Set(float64(built.Unix()))
+
+	// Cached documents came from the DB just replaced, so drop them. Scans already
+	// running still write their (old-DB) result afterwards; those age out with the
+	// normal cache TTL.
+	b.c.TTL.DeleteAll()
+
+	b.logger.Info("grype DB updated", zap.Time("dbBuilt", built))
+
+	return nil
+}
+
+// updateDB downloads and installs the current vulnerability DB without opening
+// it, so the download does not happen while scans are blocked.
+func updateDB(opts Options) error {
+	distConfig, instConfig := dbConfig(opts)
+
+	client, err := distribution.NewClient(distConfig)
+	if err != nil {
+		return fmt.Errorf("error creating grype distribution client: %w", err)
+	}
+
+	curator, err := installation.NewCurator(instConfig, client)
+	if err != nil {
+		return fmt.Errorf("error creating grype DB curator: %w", err)
+	}
+
+	if _, err = curator.Update(); err != nil {
+		return fmt.Errorf("error updating grype DB: %w", err)
+	}
+
+	return nil
+}
+
+// refreshLoop updates the vulnerability DB once a day at updateAt, retrying until
+// it succeeds. It is a no-op when no schedule is configured.
+func (b *Builder) refreshLoop(opts Options, updateAt time.Duration) {
+	defer close(b.refreshDone)
+
+	if opts.DatabaseUpdateAt == "" {
+		return
+	}
+
+	// don't race the initial load for the same DB directory.
+	select {
+	case <-b.stop:
+		return
+	case <-b.initDone:
+	}
+
+	for {
+		delay := schedule.UntilNext(time.Now(), updateAt)
+
+		b.logger.Info("grype DB update scheduled", zap.Duration("in", delay))
+
+		select {
+		case <-b.stop:
+			return
+		case <-time.After(delay):
+		}
+
+		// Retry until the DB is loaded: a refresh that fails after closing the old
+		// DB leaves nothing to scan with, and waiting a day to try again would
+		// leave the endpoint unavailable for that long.
+		for {
+			err := b.refresh(opts)
+			if err == nil {
+				break
+			}
+
+			b.logger.Error(
+				"grype DB update failed",
+				zap.Error(err),
+				zap.Duration("retryIn", dbRefreshRetryInterval),
+			)
+
+			select {
+			case <-b.stop:
+				return
+			case <-time.After(dbRefreshRetryInterval):
+			}
+		}
+	}
 }
 
 // Start runs the cache eviction goroutine; should be invoked in a goroutine.
@@ -165,13 +380,20 @@ func (b *Builder) Ready() error {
 }
 
 // Stop releases the Grype DB handle and stops cache eviction. Waits for
-// in-flight init to settle so the underlying handle is not leaked on shutdown.
+// in-flight init and the refresh loop to settle so the underlying handle is not
+// leaked on shutdown.
 func (b *Builder) Stop() error {
+	close(b.stop)
+
 	<-b.initDone
+	<-b.refreshDone
 
 	b.c.Stop()
 
-	sc := b.scanner.Load()
+	b.dbMu.Lock()
+	defer b.dbMu.Unlock()
+
+	sc := b.scanner.Swap(nil)
 	if sc == nil {
 		return nil
 	}
@@ -272,14 +494,16 @@ func (b *Builder) scanAndCache(reqID, username, schematicID, versionTag, arch, k
 		return cachedScan{}, fmt.Errorf("error building Talos SBOM: %w", err)
 	}
 
+	defer r.Close() //nolint:errcheck
+
 	sbomBytes, err := io.ReadAll(r)
 	if err != nil {
 		return cachedScan{}, fmt.Errorf("error reading SBOM bytes: %w", err)
 	}
 
-	vexBytes, err := b.vexSource.Build(ctx, versionTag)
+	vexBytes, err := b.buildVEX(ctx, versionTag, sbomBytes)
 	if err != nil {
-		return cachedScan{}, fmt.Errorf("error fetching VEX document: %w", err)
+		return cachedScan{}, err
 	}
 
 	workDir, err := os.MkdirTemp("", "image-factory-scan-*")
@@ -298,14 +522,7 @@ func (b *Builder) scanAndCache(reqID, username, schematicID, versionTag, arch, k
 		return cachedScan{}, fmt.Errorf("error writing VEX: %w", err)
 	}
 
-	now := time.Now()
-
-	sc := b.scanner.Load()
-	if sc == nil {
-		return cachedScan{}, ErrNotReady
-	}
-
-	doc, sbomDoc, err := sc.ScanSBOM(sbomPath, &now, vexPath)
+	doc, sbomDoc, err := b.scanSBOM(sbomPath, vexPath)
 	if err != nil {
 		return cachedScan{}, fmt.Errorf("error scanning SBOM: %w", err)
 	}
@@ -322,14 +539,50 @@ func (b *Builder) scanAndCache(reqID, username, schematicID, versionTag, arch, k
 	return entry, nil
 }
 
+func (b *Builder) buildVEX(ctx context.Context, versionTag string, sbomBytes []byte) ([]byte, error) {
+	kernelVersion, err := kernelversion.FromSPDXJSON(sbomBytes)
+	if err != nil {
+		return nil, fmt.Errorf("error reading kernel version from Talos SBOM: %w", err)
+	}
+
+	if kernelVersion == "" {
+		return nil, errors.New("kernel package is missing from Talos SBOM")
+	}
+
+	vexBytes, err := b.vexSource.BuildForKernel(ctx, versionTag, kernelVersion)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching VEX document: %w", err)
+	}
+
+	return vexBytes, nil
+}
+
+// scanSBOM matches the SBOM against the loaded vulnerability DB, holding the DB
+// read lock so a scheduled update cannot close the provider mid-scan.
+func (b *Builder) scanSBOM(sbomPath, vexPath string) (*models.Document, *sbom.SBOM, error) {
+	b.dbMu.RLock()
+	defer b.dbMu.RUnlock()
+
+	sc := b.scanner.Load()
+	if sc == nil {
+		return nil, nil, ErrNotReady
+	}
+
+	now := time.Now()
+
+	return sc.ScanSBOM(sbomPath, &now, vexPath)
+}
+
 // Describe implements prom.Collector interface.
 func (b *Builder) Describe(ch chan<- *prometheus.Desc) {
 	b.c.Describe(ch)
+	b.metricDB.Describe(ch)
 }
 
 // Collect implements prom.Collector interface.
 func (b *Builder) Collect(ch chan<- prometheus.Metric) {
 	b.c.Collect(ch)
+	b.metricDB.Collect(ch)
 }
 
 var _ prometheus.Collector = (*Builder)(nil)

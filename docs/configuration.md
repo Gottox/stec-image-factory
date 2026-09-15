@@ -3,7 +3,10 @@
 ## CLI Usage
 
 ```console
-Usage of image-factory:
+Usage:
+  image-factory [flags]              Run the factory.
+
+Flags:
       --config configs    Configuration source(s). Can be specified multiple times or as a comma-separated list.
                           Supported forms:
                             env=[PREFIX]        Load configuration from environment variables (optional prefix).
@@ -291,7 +294,19 @@ Defaults to the public Sigstore instance.
 - **Env:** `CACHE_GSA_REKORURL`
 
 RekorURL is the Rekor transparency log endpoint.
-Defaults to the public Sigstore instance.
+It must point at a Rekor v2 (tile-backed) log; Rekor v1 is no longer supported for signing.
+Setting it requires TSAURL as well, since Rekor v2 does not timestamp entries.
+If FulcioURL, RekorURL and TSAURL are all empty, the Sigstore public-good signing config is fetched from TUF.
+
+---
+
+### `cache.gsa.tsaURL`
+
+- **Type:** `string`
+- **Env:** `CACHE_GSA_TSAURL`
+
+TSAURL is the RFC3161 timestamp authority endpoint.
+Required whenever RekorURL is set.
 
 ---
 
@@ -654,7 +669,16 @@ OverlayManifest is the image manifest for overlays.
 - **Type:** `string`
 - **Env:** `ARTIFACTS_CORE_COMPONENTS_TALOSCTL`
 
-Talosctl is the image containing the Talos CLI tool.
+Talosctl is the image containing the Talos CLI tool (talosctl-all).
+
+---
+
+### `artifacts.core.components.imageFactory`
+
+- **Type:** `string`
+- **Env:** `ARTIFACTS_CORE_COMPONENTS_IMAGEFACTORY`
+
+ImageFactory is the image containing the Image Factory itself.
 
 ---
 
@@ -847,6 +871,16 @@ Enabled enables authentication.
 
 ---
 
+### `authentication.provider`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_PROVIDER`
+
+Provider selects the authentication backend.
+Valid values are "htpasswd" (default) and "auth0".
+
+---
+
 ### `authentication.htpasswdPath`
 
 - **Type:** `string`
@@ -858,7 +892,279 @@ The file follows the standard htpasswd format (username:bcrypt_hash, one per lin
 Multiple entries with the same username are supported, allowing multiple API keys per user.
 Only bcrypt hashes ($2y$/$2a$/$2b$) are accepted.
 
-It is required if authentication is enabled.
+It is required when provider is "htpasswd" (the default).
+
+---
+
+### `authentication.auth0`
+
+Auth0 holds configuration for the Auth0 JWT authentication provider.
+
+Tokens must carry a non-empty string in the custom `if_org_id` claim,
+which becomes the caller identity in the same way a username does for htpasswd.
+Auth0's native `org_id` claim is not read.
+
+It is required when provider is "auth0", and ignored otherwise.
+
+Domain and audience alone validate bearer tokens.
+The browser-login fields are optional, and add the sign-in routes on top when set.
+
+---
+
+### `authentication.auth0.domain`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_AUTH0_DOMAIN`
+
+Domain is the Auth0 tenant domain, e.g. `mycompany.auth0.com`.
+
+Required.
+
+---
+
+### `authentication.auth0.audience`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_AUTH0_AUDIENCE`
+
+Audience is the Auth0 API identifier (audience claim), e.g. `https://image-factory.example.com`.
+
+Required.
+
+---
+
+### `authentication.auth0.clientID`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_AUTH0_CLIENTID`
+
+ClientID is the Auth0 application Client ID used for the browser login flow.
+
+Optional; part of the browser-login group.
+
+---
+
+### `authentication.auth0.clientSecret`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_AUTH0_CLIENTSECRET`
+
+ClientSecret is the Auth0 application Client Secret.
+Inject via IF_AUTHENTICATION_AUTH0_CLIENTSECRET environment variable.
+
+Optional; part of the browser-login group.
+
+---
+
+### `authentication.auth0.sessionKey`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_AUTH0_SESSIONKEY`
+
+SessionKey is the base64-encoded 32-byte AES-256 key used to encrypt session cookies.
+Inject via IF_AUTHENTICATION_AUTH0_SESSIONKEY environment variable.
+Generate one with `openssl rand -base64 32`.
+Surrounding whitespace is trimmed, so a file or mounted secret with a trailing newline works.
+All replicas must share the same key, since a session or in-progress login started
+on one replica has to be decrypted by whichever replica handles the next request.
+
+Optional; part of the browser-login group.
+
+---
+
+### `authentication.tokens`
+
+Tokens holds configuration for self-issued API token management.
+
+---
+
+### `authentication.tokens.keyPaths`
+
+- **Type:** `[]string`
+- **Env:** `AUTHENTICATION_TOKENS_KEYPATHS`
+
+KeyPaths is an ordered list of PEM-encoded ECDSA P-256 keys or certificates.
+The first entry must be a private key and is the only key used to mint tokens.
+Later entries are verification-only and may contain private keys, public keys, or X.509 certificates.
+If empty, a fresh in-memory key is generated at startup.
+Previously issued tokens then stop working after a restart,
+and tokens minted by one replica are not accepted by another, so this is suitable only for disposable single-process development.
+
+---
+
+### `authentication.tokens.storage`
+
+Storage is the base OCI repository under which stored token records are persisted; presence of a record is what makes such a token valid.
+Each provider-resolved principal gets its own repository beneath it, holding one tag per token,
+so a listing costs one principal's tokens rather than every token in the deployment.
+A token minted with "stored": false is not recorded, so it cannot be listed or revoked and does not count against MaxPerOrg.
+
+---
+
+### `authentication.tokens.storage.registry`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_TOKENS_STORAGE_REGISTRY`
+
+Registry is the hostname of the container registry, e.g., `ghcr.io`.
+This is where images are stored.
+
+---
+
+### `authentication.tokens.storage.namespace`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_TOKENS_STORAGE_NAMESPACE`
+
+Namespace is the repository namespace or organization within the registry, e.g., `sidero-labs`.
+Some registries allow repositories without a namespace.
+
+---
+
+### `authentication.tokens.storage.repository`
+
+- **Type:** `string`
+- **Env:** `AUTHENTICATION_TOKENS_STORAGE_REPOSITORY`
+
+Repository is the name of the repository inside the namespace, e.g., `talos`.
+Combined with Registry and Namespace, it forms the fully qualified repository path.
+
+---
+
+### `authentication.tokens.storage.insecure`
+
+- **Type:** `bool`
+- **Env:** `AUTHENTICATION_TOKENS_STORAGE_INSECURE`
+
+Insecure allows connections to registries over HTTP or with invalid TLS certificates.
+
+---
+
+### `authentication.tokens.ttl`
+
+TTL bounds token lifetimes by whether they are stored, plus the CLI-only bootstrap policy.
+
+---
+
+### `authentication.tokens.ttl.stored`
+
+Stored bounds revocable tokens persisted in the configured OCI repository.
+
+---
+
+### `authentication.tokens.ttl.stored.max`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_STORED_MAX`
+
+Max is the longest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.stored.min`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_STORED_MIN`
+
+Min is the shortest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.stored.default`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_STORED_DEFAULT`
+
+Default is the validity duration granted when the caller requests no explicit TTL.
+
+---
+
+### `authentication.tokens.ttl.ephemeral`
+
+Ephemeral bounds tokens with no per-token list or revoke operation.
+They normally leave circulation through expiry;
+removing a verification key retires every token signed by that key.
+
+---
+
+### `authentication.tokens.ttl.ephemeral.max`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_EPHEMERAL_MAX`
+
+Max is the longest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.ephemeral.min`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_EPHEMERAL_MIN`
+
+Min is the shortest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.ephemeral.default`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_EPHEMERAL_DEFAULT`
+
+Default is the validity duration granted when the caller requests no explicit TTL.
+
+---
+
+### `authentication.tokens.ttl.bootstrap`
+
+Bootstrap bounds the CLI-only cross-subject credential.
+It is never stored and may live longer than ordinary ephemeral tokens because it is kept
+offline and retired by removing its signing key from KeyPaths.
+
+---
+
+### `authentication.tokens.ttl.bootstrap.max`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_MAX`
+
+Max is the longest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.bootstrap.min`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_MIN`
+
+Min is the shortest validity duration a caller may request.
+
+---
+
+### `authentication.tokens.ttl.bootstrap.default`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_DEFAULT`
+
+Default is the validity duration granted when the caller requests no explicit TTL.
+
+---
+
+### `authentication.tokens.refreshInterval`
+
+- **Type:** `time.Duration`
+- **Env:** `AUTHENTICATION_TOKENS_REFRESHINTERVAL`
+
+RefreshInterval controls how often the backing registry clients are rebuilt
+so refreshed credentials are picked up.
+
+---
+
+### `authentication.tokens.maxPerOrg`
+
+- **Type:** `int`
+- **Env:** `AUTHENTICATION_TOKENS_MAXPERORG`
+
+MaxPerOrg caps how many stored tokens a provider-resolved principal may have active at once.
 
 ---
 
@@ -934,6 +1240,31 @@ Scanner contains configuration for the vulnerability scanner.
 
 DatabaseURL overrides the Grype vulnerability database listing URL.
 Set this to point at a mirror or air-gapped database service.
+
+---
+
+### `enterprise.scanner.databaseUpdateAt`
+
+- **Type:** `string`
+- **Env:** `ENTERPRISE_SCANNER_DATABASEUPDATEAT`
+
+DatabaseUpdateAt is the local time of day ("HH:MM") at which the Grype vulnerability database is updated.
+Empty disables the schedule, leaving the database at the build downloaded when the process started.
+
+Scan results depend on the database build, so replicas that started at different times otherwise disagree about the same report.
+Pick a time after the upstream database is published (Anchore publishes daily around 06:40 UTC) so every replica converges on the same build for the rest of the day.
+Times are interpreted in the process timezone (TZ, UTC in the container).
+
+---
+
+### `enterprise.scanner.databaseRootDir`
+
+- **Type:** `string`
+- **Env:** `ENTERPRISE_SCANNER_DATABASEROOTDIR`
+
+DatabaseRootDir is where the Grype vulnerability database is installed.
+The Helm chart mounts a volume at the default path, so a persistent volume
+keeps the database (and the scan results it produces) across restarts.
 
 ---
 
@@ -1157,6 +1488,7 @@ artifacts:
     core:
         components:
             extensionManifest: siderolabs/extensions
+            imageFactory: siderolabs/image-factory
             imager: siderolabs/imager
             installer: siderolabs/installer
             installerBase: siderolabs/installer-base
@@ -1191,8 +1523,37 @@ audit:
         path: ""
     mode: ""
 authentication:
+    auth0:
+        audience: ""
+        clientID: ""
+        clientSecret: ""
+        domain: ""
+        sessionKey: ""
     enabled: false
     htpasswdPath: ""
+    provider: htpasswd
+    tokens:
+        keyPaths: []
+        maxPerOrg: 10
+        refreshInterval: 5m0s
+        storage:
+            insecure: false
+            namespace: siderolabs/image-factory
+            registry: ghcr.io
+            repository: tokens
+        ttl:
+            bootstrap:
+                default: 2160h0m0s
+                max: 87600h0m0s
+                min: 1h0m0s
+            ephemeral:
+                default: 5m0s
+                max: 8h0m0s
+                min: 30s
+            stored:
+                default: 8760h0m0s
+                max: 8760h0m0s
+                min: 1h0m0s
 build:
     brokenTalosVersions: []
     maxConcurrency: 6
@@ -1207,6 +1568,7 @@ cache:
         keyFile: ""
         rekorURL: ""
         serviceAccountEmail: ""
+        tsaURL: ""
     oci:
         insecure: false
         namespace: siderolabs/image-factory
@@ -1241,7 +1603,9 @@ enterprise:
         cache:
             capacity: 4096
             ttl: 15m0s
+        databaseRootDir: /var/lib/grype
         databaseURL: https://grype.anchore.io/databases
+        databaseUpdateAt: "07:00"
     spdx:
         cache:
             insecure: false
@@ -1292,6 +1656,7 @@ secureBoot:
 
 ```env
 IF_ARTIFACTS_CORE_COMPONENTS_EXTENSIONMANIFEST=siderolabs/extensions
+IF_ARTIFACTS_CORE_COMPONENTS_IMAGEFACTORY=siderolabs/image-factory
 IF_ARTIFACTS_CORE_COMPONENTS_IMAGER=siderolabs/imager
 IF_ARTIFACTS_CORE_COMPONENTS_INSTALLER=siderolabs/installer
 IF_ARTIFACTS_CORE_COMPONENTS_INSTALLERBASE=siderolabs/installer-base
@@ -1319,8 +1684,30 @@ IF_AUDIT_FILE_MAXBACKUPS=16
 IF_AUDIT_FILE_MAXSIZEMB=256
 IF_AUDIT_FILE_PATH=
 IF_AUDIT_MODE=
+IF_AUTHENTICATION_AUTH0_AUDIENCE=
+IF_AUTHENTICATION_AUTH0_CLIENTID=
+IF_AUTHENTICATION_AUTH0_CLIENTSECRET=
+IF_AUTHENTICATION_AUTH0_DOMAIN=
+IF_AUTHENTICATION_AUTH0_SESSIONKEY=
 IF_AUTHENTICATION_ENABLED=false
 IF_AUTHENTICATION_HTPASSWDPATH=
+IF_AUTHENTICATION_PROVIDER=htpasswd
+IF_AUTHENTICATION_TOKENS_KEYPATHS=[]
+IF_AUTHENTICATION_TOKENS_MAXPERORG=10
+IF_AUTHENTICATION_TOKENS_REFRESHINTERVAL=5m0s
+IF_AUTHENTICATION_TOKENS_STORAGE_INSECURE=false
+IF_AUTHENTICATION_TOKENS_STORAGE_NAMESPACE=siderolabs/image-factory
+IF_AUTHENTICATION_TOKENS_STORAGE_REGISTRY=ghcr.io
+IF_AUTHENTICATION_TOKENS_STORAGE_REPOSITORY=tokens
+IF_AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_DEFAULT=2160h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_MAX=87600h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_BOOTSTRAP_MIN=1h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_EPHEMERAL_DEFAULT=5m0s
+IF_AUTHENTICATION_TOKENS_TTL_EPHEMERAL_MAX=8h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_EPHEMERAL_MIN=30s
+IF_AUTHENTICATION_TOKENS_TTL_STORED_DEFAULT=8760h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_STORED_MAX=8760h0m0s
+IF_AUTHENTICATION_TOKENS_TTL_STORED_MIN=1h0m0s
 IF_BUILD_BROKENTALOSVERSIONS=[]
 IF_BUILD_MAXCONCURRENCY=6
 IF_BUILD_MINTALOSVERSION=1.2.0
@@ -1331,6 +1718,7 @@ IF_CACHE_GSA_FULCIOURL=
 IF_CACHE_GSA_KEYFILE=
 IF_CACHE_GSA_REKORURL=
 IF_CACHE_GSA_SERVICEACCOUNTEMAIL=
+IF_CACHE_GSA_TSAURL=
 IF_CACHE_OCI_INSECURE=false
 IF_CACHE_OCI_NAMESPACE=siderolabs/image-factory
 IF_CACHE_OCI_REGISTRY=ghcr.io
@@ -1356,6 +1744,8 @@ IF_ENTERPRISE_EXTRAEXTENSIONS_MANIFEST_REGISTRY=
 IF_ENTERPRISE_EXTRAEXTENSIONS_MANIFEST_REPOSITORY=
 IF_ENTERPRISE_SCANNER_CACHE_CAPACITY=4096
 IF_ENTERPRISE_SCANNER_CACHE_TTL=15m0s
+IF_ENTERPRISE_SCANNER_DATABASEROOTDIR=/var/lib/grype
+IF_ENTERPRISE_SCANNER_DATABASEUPDATEAT=07:00
 IF_ENTERPRISE_SCANNER_DATABASEURL=https://grype.anchore.io/databases
 IF_ENTERPRISE_SPDX_CACHE_INSECURE=false
 IF_ENTERPRISE_SPDX_CACHE_NAMESPACE=siderolabs/image-factory

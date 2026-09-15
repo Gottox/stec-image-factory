@@ -8,9 +8,11 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/siderolabs/gen/ensure"
 	"github.com/siderolabs/talos/pkg/imager/profile"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -299,6 +301,174 @@ func TestParseFromPath(t *testing.T) {
 
 type mockArtifactProducer struct{}
 
+type dependencyArtifactProducer struct {
+	mockArtifactProducer
+
+	installerHex   string
+	installerCalls int
+	extensionCalls int
+}
+
+func (producer *dependencyArtifactProducer) GetInstallerDependency(_ context.Context, arch artifacts.Arch, _ string) (artifacts.ImageDependency, error) {
+	producer.installerCalls++
+
+	digestHex := producer.installerHex
+	if digestHex == "" {
+		digestHex = strings.Repeat("a", 64)
+	}
+
+	digest := v1.Hash{Algorithm: "sha256", Hex: digestHex}
+
+	return artifacts.ImageDependency{
+		OCIPath: "resolved-installer.oci",
+		Name:    "siderolabs/installer-base",
+		Ref:     ensure.Value(name.NewDigest("ghcr.io/siderolabs/installer-base@" + digest.String())),
+		Descriptor: v1.Descriptor{
+			Digest:   digest,
+			Platform: &v1.Platform{OS: "linux", Architecture: string(arch)},
+		},
+	}, nil
+}
+
+func (producer *dependencyArtifactProducer) GetExtensionDependency(_ context.Context, arch artifacts.Arch, ref artifacts.ExtensionRef) (artifacts.ImageDependency, error) {
+	producer.extensionCalls++
+
+	digest := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("b", 64)}
+
+	return artifacts.ImageDependency{
+		OCIPath: "resolved-extension.oci",
+		Name:    ref.TaggedReference.RepositoryStr(),
+		Ref:     ensure.Value(name.NewDigest(ref.TaggedReference.Context().Name() + "@" + digest.String())),
+		Descriptor: v1.Descriptor{
+			Digest:   digest,
+			Platform: &v1.Platform{OS: "linux", Architecture: string(arch)},
+		},
+	}, nil
+}
+
+func (producer *dependencyArtifactProducer) GetOverlayDependency(context.Context, artifacts.Arch, artifacts.OverlayRef) (artifacts.ImageDependency, error) {
+	return artifacts.ImageDependency{}, fmt.Errorf("unexpected overlay dependency resolution")
+}
+
+func TestUnifiedInstallerSecureBootBehavior(t *testing.T) {
+	enabledService, err := secureboot.NewService(secureboot.Options{
+		Enabled:         true,
+		SigningKeyPath:  "sign-key.pem",
+		SigningCertPath: "sign-cert.pem",
+		PCRKeyPath:      "pcr-key.pem",
+	})
+	require.NoError(t, err)
+
+	disabledService, err := secureboot.NewService(secureboot.Options{})
+	require.NoError(t, err)
+
+	enhance := func(t *testing.T, secureBoot bool, service *secureboot.Service, version string) (profile.Profile, error) {
+		t.Helper()
+
+		return imageprofile.EnhanceFromSchematic(
+			t.Context(),
+			imageprofile.InstallerProfile(secureBoot, artifacts.ArchAmd64, constants.PlatformMetal),
+			&schematic.Schematic{},
+			mockArtifactProducer{},
+			service,
+			version,
+		)
+	}
+
+	t.Run("enabled service collapses both installer variants into one", func(t *testing.T) {
+		standard, standardErr := enhance(t, false, enabledService, "v1.14.0")
+		require.NoError(t, standardErr)
+
+		secure, secureErr := enhance(t, true, enabledService, "v1.14.0")
+		require.NoError(t, secureErr)
+
+		require.True(t, standard.SecureBootEnabled())
+		require.NotNil(t, standard.Input.SecureBoot)
+		require.Equal(t, secure, standard)
+	})
+
+	t.Run("installers stay distinct while signing forces lockdown", func(t *testing.T) {
+		standard, standardErr := enhance(t, false, enabledService, "v1.13.0")
+		require.NoError(t, standardErr)
+
+		secure, secureErr := enhance(t, true, enabledService, "v1.13.0")
+		require.NoError(t, secureErr)
+
+		require.False(t, standard.SecureBootEnabled())
+		require.Nil(t, standard.Input.SecureBoot)
+		require.True(t, secure.SecureBootEnabled())
+		require.NotEqual(t, secure, standard)
+	})
+
+	t.Run("disabled service keeps standard installer available", func(t *testing.T) {
+		standard, standardErr := enhance(t, false, disabledService, "v1.14.0")
+		require.NoError(t, standardErr)
+		require.False(t, standard.SecureBootEnabled())
+		require.Nil(t, standard.Input.SecureBoot)
+	})
+
+	t.Run("disabled service rejects secure boot installer", func(t *testing.T) {
+		_, secureErr := enhance(t, true, disabledService, "v1.14.0")
+		require.ErrorIs(t, secureErr, secureboot.ErrDisabled)
+	})
+
+	t.Run("legacy installers remain distinct", func(t *testing.T) {
+		standard, standardErr := enhance(t, false, enabledService, "v1.9.0")
+		require.NoError(t, standardErr)
+
+		secure, secureErr := enhance(t, true, enabledService, "v1.9.0")
+		require.NoError(t, secureErr)
+
+		require.False(t, standard.SecureBootEnabled())
+		require.True(t, secure.SecureBootEnabled())
+		require.NotEqual(t, secure, standard)
+	})
+}
+
+func TestEnhanceFromSchematicCapturesConsumedDependencies(t *testing.T) {
+	producer := &dependencyArtifactProducer{}
+	prof := imageprofile.InstallerProfile(false, artifacts.ArchAmd64, constants.PlatformMetal)
+	schematic := &schematic.Schematic{
+		Customization: schematic.Customization{
+			SystemExtensions: schematic.SystemExtensions{
+				OfficialExtensions: []string{"siderolabs/amd-ucode"},
+			},
+		},
+	}
+
+	result, err := imageprofile.EnhanceFromSchematicWithDependencies(
+		t.Context(),
+		prof,
+		schematic,
+		producer,
+		nil,
+		"v1.13.0",
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, producer.installerCalls)
+	require.Equal(t, 1, producer.extensionCalls)
+	require.Equal(t, "resolved-installer.oci", result.Profile.Input.BaseInstaller.OCIPath)
+	require.Equal(t, result.Dependencies[0].Image.Ref.String(), result.Profile.Input.BaseInstaller.ImageRef)
+	require.Equal(t, "resolved-extension.oci", result.Profile.Input.SystemExtensions[0].OCIPath)
+	require.Equal(t, []string{"base-installer", "extension"}, []string{result.Dependencies[0].Kind, result.Dependencies[1].Kind})
+
+	secondResult, err := imageprofile.EnhanceFromSchematicWithDependencies(
+		t.Context(),
+		imageprofile.InstallerProfile(false, artifacts.ArchAmd64, constants.PlatformMetal),
+		schematic,
+		&dependencyArtifactProducer{installerHex: strings.Repeat("c", 64)},
+		nil,
+		"v1.13.0",
+	)
+	require.NoError(t, err)
+
+	firstHash, err := imageprofile.Hash(result.Profile)
+	require.NoError(t, err)
+	secondHash, err := imageprofile.Hash(secondResult.Profile)
+	require.NoError(t, err)
+	require.NotEqual(t, firstHash, secondHash)
+}
+
 func (mockArtifactProducer) GetSchematicExtension(_ context.Context, _ string, schematic *schematic.Schematic) (string, error) {
 	id, err := schematic.ID()
 	if err != nil {
@@ -444,7 +614,7 @@ func TestEnhanceFromSchematic(t *testing.T) {
 	tests := []testCase{} //nolint:prealloc
 
 	// Generate systematic test cases
-	versions := []string{"v1.5.0", "v1.6.0", "v1.7.0", "v1.8.0", "v1.9.0", "v1.10.0", "v1.11.0", "v1.12.0", "v1.13.0"}
+	versions := []string{"v1.5.0", "v1.6.0", "v1.7.0", "v1.8.0", "v1.9.0", "v1.10.0", "v1.11.0", "v1.12.0", "v1.13.0", "v1.14.0"}
 	archs := []string{"amd64", "arm64"}
 	secureBootStates := []bool{false, true}
 	outputKinds := []profile.OutputKind{profile.OutKindISO, profile.OutKindImage, profile.OutKindInstaller}
@@ -693,7 +863,19 @@ func generateTestName(version, arch, outputKind, extraSuffix string, secureBoot 
 	return name
 }
 
+// autoSignsInstaller mirrors the condition under which a standard installer is signed anyway,
+// because it builds the very same UKI as the secure boot one.
+func autoSignsInstaller(version string) bool {
+	q := quirks.New(version)
+
+	return q.SupportsUnifiedInstaller() && !q.ForcesLockdownConfidentiality()
+}
+
 func defaultExpectedProfile(version, arch string, outKind profile.OutputKind, secureboot bool) profile.Profile {
+	if outKind == profile.OutKindInstaller && autoSignsInstaller(version) {
+		secureboot = true
+	}
+
 	prof := profile.Profile{
 		Platform:   constants.PlatformMetal,
 		SecureBoot: new(secureboot),
@@ -784,7 +966,7 @@ func defaultExpectedProfileWithExtensionsKernelArgs(version, arch string, outKin
 		}
 	case profile.OutKindInstaller:
 		if secureboot || quirks.New(version).SupportsUnifiedInstaller() {
-			prof.Customization.ExtraKernelArgs = []string{"noapic", "nolapic"}
+			prof.Customization.ExtraKernelArgs = append(prof.Customization.ExtraKernelArgs, "noapic", "nolapic")
 		}
 	}
 
@@ -795,7 +977,7 @@ func defaultExpectedProfileWithOverlayExtensionsKernelArgs(version, arch string,
 	prof := defaultExpectedProfile(version, arch, outKind, secureboot)
 
 	if quirks.New(version).SupportsUnifiedInstaller() {
-		prof.Customization.ExtraKernelArgs = []string{"noapic", "nolapic"}
+		prof.Customization.ExtraKernelArgs = append(prof.Customization.ExtraKernelArgs, "noapic", "nolapic")
 	}
 
 	prof.Input.OverlayInstaller = profile.ContainerAsset{

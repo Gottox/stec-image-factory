@@ -40,6 +40,7 @@ const SPDXBundleMediaType types.MediaType = "application/vnd.sidero.dev-image.sp
 type Options struct {
 	CacheImageSigner        signer.Signer
 	CacheRepository         name.Repository
+	NameOptions             []name.Option
 	RemoteOptions           []remote.Option
 	RegistryRefreshInterval time.Duration
 }
@@ -65,12 +66,12 @@ func NewStorage(logger *zap.Logger, options Options) (*Storage, error) {
 
 	var err error
 
-	s.puller, err = remotewrap.NewPuller(options.RegistryRefreshInterval, options.RemoteOptions...)
+	s.puller, err = remotewrap.NewPuller(options.RegistryRefreshInterval, options.NameOptions, options.RemoteOptions)
 	if err != nil {
 		return nil, fmt.Errorf("error creating puller: %w", err)
 	}
 
-	s.pusher, err = remotewrap.NewPusher(options.RegistryRefreshInterval, options.RemoteOptions...)
+	s.pusher, err = remotewrap.NewPusher(options.RegistryRefreshInterval, options.NameOptions, options.RemoteOptions)
 	if err != nil {
 		return nil, fmt.Errorf("error creating pusher: %w", err)
 	}
@@ -116,7 +117,7 @@ func (s *Storage) Get(ctx context.Context, cacheTag string) (storage.Bundle, err
 	digestRef := s.cacheRepository.Digest(desc.Digest.String())
 
 	// Verify signature
-	err = s.imageSigner.VerifyImage(ctx, digestRef)
+	err = s.imageSigner.VerifyImage(ctx, digestRef, s.puller)
 	if err != nil {
 		ctxlog.Logger(ctx, s.logger).Warn("SPDX bundle signature doesn't validate", zap.Error(err), zap.Stringer("ref", taggedRef))
 
@@ -181,10 +182,6 @@ func (s *Storage) Put(ctx context.Context, cacheTag string, data io.Reader, size
 		return fmt.Errorf("failed to append layer: %w", err)
 	}
 
-	if err = s.pusher.Push(ctx, taggedRef, img); err != nil {
-		return fmt.Errorf("failed to push SPDX bundle: %w", err)
-	}
-
 	digest, err := img.Digest()
 	if err != nil {
 		return fmt.Errorf("failed to get image digest: %w", err)
@@ -192,10 +189,29 @@ func (s *Storage) Put(ctx context.Context, cacheTag string, data io.Reader, size
 
 	digestRef := s.cacheRepository.Digest(digest.String())
 
+	// Publish by digest, sign, and only then move the tag, so the tag never names
+	// a manifest whose signature is not there yet.
+	//
+	// Get resolves the tag and rejects what it finds if the signature does not
+	// verify, and the bundle content is not reproducible: two builders racing on
+	// the same cache key push different digests, and whoever tags last wins. With
+	// the tag moved first, the loser's own read-back resolves to the winner's
+	// still-unsigned digest and fails the request. Signing before tagging leaves
+	// every value the tag can hold already verifiable.
+	if err = s.pusher.Push(ctx, digestRef, img); err != nil {
+		return fmt.Errorf("failed to push SPDX bundle: %w", err)
+	}
+
 	ctxlog.Logger(ctx, s.logger).Info("signing SPDX bundle", zap.Stringer("ref", digestRef))
 
-	if err := s.imageSigner.SignImage(ctx, digestRef, s.pusher); err != nil {
+	if err = s.imageSigner.SignImage(ctx, digestRef, s.pusher); err != nil {
 		return fmt.Errorf("error signing SPDX bundle: %w", err)
+	}
+
+	// the blobs and the manifest are already in the registry, so this is a manifest
+	// PUT under the tag.
+	if err = s.pusher.Push(ctx, taggedRef, img); err != nil {
+		return fmt.Errorf("failed to tag SPDX bundle: %w", err)
 	}
 
 	return nil

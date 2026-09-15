@@ -97,12 +97,12 @@ func RunFactory(ctx context.Context, logger *zap.Logger, opts Options) error {
 		return err
 	}
 
-	cacheImageSigner, err := buildCacheSigner(opts)
+	cacheImageSigner, err := buildCacheSigner(ctx, opts)
 	if err != nil {
 		return fmt.Errorf("failed to build image signer: %w", err)
 	}
 
-	assetBuilder, err := buildAssetBuilder(logger, artifactsManager, cacheImageSigner, opts)
+	assetBuilder, assetCache, err := buildAssetBuilder(logger, artifactsManager, cacheImageSigner, opts)
 	if err != nil {
 		return err
 	}
@@ -112,7 +112,7 @@ func RunFactory(ctx context.Context, logger *zap.Logger, opts Options) error {
 		return err
 	}
 
-	authProvider, err := buildAuthProvider(logger, opts)
+	authProvider, err := buildAuthProvider(ctx, logger, opts)
 	if err != nil {
 		return err
 	}
@@ -121,7 +121,9 @@ func RunFactory(ctx context.Context, logger *zap.Logger, opts Options) error {
 		eg.Go(func() error { return authProvider.Run(ctx) })
 	}
 
-	enterprisePlugins, err := buildEnterprisePlugins(ctx, eg, logger, configFactory, artifactsManager, assetBuilder, cacheImageSigner, authProvider, opts)
+	enterprisePlugins, spdxSource, tokenVerifier, err := buildEnterprisePlugins(
+		ctx, eg, logger, configFactory, artifactsManager, assetBuilder, cacheImageSigner, authProvider, opts,
+	)
 	if err != nil {
 		return err
 	}
@@ -152,14 +154,23 @@ func RunFactory(ctx context.Context, logger *zap.Logger, opts Options) error {
 	}
 
 	frontendOptions.AuditSink = auditSink
+	frontendOptions.TokenVerifier = tokenVerifier
+	frontendOptions.InstallerSBOMSource = spdxSource
+
+	signatureWriter, err := buildSignatureWriter(logger, frontendOptions.CacheImageSigner, assetCache)
+	if err != nil {
+		return err
+	}
 
 	frontendHTTP, err := frontendhttp.NewFrontend(
+		ctx,
 		logger,
 		configFactory,
 		assetBuilder,
 		artifactsManager,
 		secureBootService,
 		enterprise.NewChecksummer(),
+		signatureWriter,
 		enterprisePlugins,
 		frontendOptions,
 	)
@@ -198,21 +209,58 @@ func buildSecureBootService(opts Options) (*secureboot.Service, error) {
 	return svc, nil
 }
 
-func buildAuthProvider(logger *zap.Logger, opts Options) (enterprise.AuthProvider, error) {
+func buildAuthProvider(ctx context.Context, logger *zap.Logger, opts Options) (enterprise.AuthProvider, error) {
+	if !enterprise.Enabled() || !opts.Authentication.Enabled {
+		return nil, nil //nolint:nilnil
+	}
+
+	var (
+		authProvider enterprise.AuthProvider
+		err          error
+	)
+
+	switch opts.Authentication.Provider {
+	case AuthProviderAuth0:
+		// Options.Validate has already rejected an undecodable or wrong-length key.
+		sessionKey, decodeErr := opts.Authentication.Auth0.DecodedSessionKey()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("auth0: session key must be base64-encoded: %w", decodeErr)
+		}
+
+		authProvider, err = enterprise.NewAuth0Provider(ctx, logger, enterprise.Auth0Config{
+			Domain:   opts.Authentication.Auth0.Domain,
+			Audience: opts.Authentication.Auth0.Audience,
+
+			ClientID:          opts.Authentication.Auth0.ClientID,
+			ClientSecret:      opts.Authentication.Auth0.ClientSecret,
+			ExternalURL:       opts.HTTP.ExternalURL,
+			SessionKey:        sessionKey,
+			IssuerURLOverride: opts.Authentication.Auth0.issuerURLOverride,
+		})
+	case AuthProviderHTPasswd:
+		authProvider, err = enterprise.NewHTPasswdProvider(logger, opts.Authentication.HTPasswdPath)
+	default:
+		return nil, fmt.Errorf("unknown authentication provider %q", opts.Authentication.Provider)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize %q authentication provider: %w", opts.Authentication.Provider, err)
+	}
+
+	return authProvider, nil
+}
+
+func buildSignatureWriter(logger *zap.Logger, imageSigner signer.Signer, cache assetcache.Cache) (enterprise.SignatureWriter, error) {
 	if !enterprise.Enabled() {
 		return nil, nil //nolint:nilnil
 	}
 
-	if !opts.Authentication.Enabled {
-		return nil, nil //nolint:nilnil
-	}
-
-	authProvider, err := enterprise.NewAuthProvider(logger, opts.Authentication.HTPasswdPath)
+	signatureWriter, err := enterprise.NewSignatureWriter(logger, imageSigner, cache)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize authentication provider: %w", err)
+		return nil, fmt.Errorf("failed to initialize signature writer: %w", err)
 	}
 
-	return authProvider, nil
+	return signatureWriter, nil
 }
 
 func buildEnterprisePlugins(
@@ -225,9 +273,9 @@ func buildEnterprisePlugins(
 	cacheImageSigner signer.Signer,
 	authProvider enterprise.AuthProvider,
 	opts Options,
-) ([]enterprise.FrontendPlugin, error) {
+) ([]enterprise.FrontendPlugin, enterprise.SPDXSource, enterprise.TokenVerifier, error) {
 	if !enterprise.Enabled() {
-		return nil, nil //nolint:nilnil
+		return nil, nil, nil, nil
 	}
 
 	spdxFrontend, spdxSource, err := enterprise.NewSpdxFrontend(logger, enterprise.SPDXOptions{
@@ -243,26 +291,27 @@ func buildEnterprisePlugins(
 		RegistryRefreshInterval: opts.Artifacts.RefreshInterval,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize SPDX frontend: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize SPDX frontend: %w", err)
 	}
 
 	imageVerifyOptions, err := buildImageVerifyOptions(logger, opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	vexFrontend, vexSource, err := enterprise.NewVEXFrontend(ctx, eg, logger, enterprise.VEXOptions{
-		Data:             opts.Enterprise.VEX.Data.String(),
-		DataInsecure:     opts.Enterprise.VEX.Data.Insecure,
-		MetricsNamespace: opts.Metrics.Namespace,
-		CacheTTL:         opts.Enterprise.VEX.Cache.TTL,
-		CacheCapacity:    opts.Enterprise.VEX.Cache.Capacity,
-		RefreshInterval:  opts.Artifacts.RefreshInterval,
-		RemoteOptions:    remoteOptions(),
-		VerifyOptions:    imageVerifyOptions,
+		KernelVersionSource: spdxSource,
+		Data:                opts.Enterprise.VEX.Data.String(),
+		DataInsecure:        opts.Enterprise.VEX.Data.Insecure,
+		MetricsNamespace:    opts.Metrics.Namespace,
+		CacheTTL:            opts.Enterprise.VEX.Cache.TTL,
+		CacheCapacity:       opts.Enterprise.VEX.Cache.Capacity,
+		RefreshInterval:     opts.Artifacts.RefreshInterval,
+		RemoteOptions:       remoteOptions(),
+		VerifyOptions:       imageVerifyOptions,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize VEX frontend: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize VEX frontend: %w", err)
 	}
 
 	scannerFrontend, err := enterprise.NewScannerFrontend(ctx, eg, logger, enterprise.ScannerOptions{
@@ -271,15 +320,34 @@ func buildEnterprisePlugins(
 		SchematicFactory: configFactory,
 		AuthProvider:     authProvider,
 		DatabaseURL:      opts.Enterprise.Scanner.DatabaseURL,
+		DatabaseUpdateAt: opts.Enterprise.Scanner.DatabaseUpdateAt,
+		DatabaseRootDir:  opts.Enterprise.Scanner.DatabaseRootDir,
 		MetricsNamespace: opts.Metrics.Namespace,
 		CacheTTL:         opts.Enterprise.Scanner.Cache.TTL,
 		CacheCapacity:    opts.Enterprise.Scanner.Cache.Capacity,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize scanner frontend: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to initialize scanner frontend: %w", err)
 	}
 
-	return []enterprise.FrontendPlugin{spdxFrontend, vexFrontend, scannerFrontend}, nil
+	plugins := []enterprise.FrontendPlugin{spdxFrontend, vexFrontend, scannerFrontend}
+
+	var tokenVerifier enterprise.TokenVerifier
+
+	if authProvider != nil {
+		tokenOpts := opts.Authentication.Tokens
+
+		var tokenPlugins []enterprise.FrontendPlugin
+
+		tokenPlugins, tokenVerifier, err = enterprise.NewTokenFrontends(logger, authProvider, tokenOpts.EnterpriseOptions(remoteOptions()))
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to initialize token frontends: %w", err)
+		}
+
+		plugins = append(plugins, tokenPlugins...)
+	}
+
+	return plugins, spdxSource, tokenVerifier, nil
 }
 
 func buildFrontendOptions(cacheImageSigner signer.Signer, authProvider enterprise.AuthProvider, opts Options) (frontendhttp.Options, error) {
@@ -315,6 +383,8 @@ func buildFrontendOptions(cacheImageSigner signer.Signer, authProvider enterpris
 		return frontendhttp.Options{}, fmt.Errorf("failed to parse internal installer repository: %w", err)
 	}
 
+	frontendOptions.InstallerInternalNameOptions = repoOpts
+
 	if opts.Artifacts.Installer.External.String() == "" {
 		frontendOptions.ProxyInstallerInternalRepository = true
 	} else {
@@ -322,6 +392,23 @@ func buildFrontendOptions(cacheImageSigner signer.Signer, authProvider enterpris
 		if err != nil {
 			return frontendhttp.Options{}, fmt.Errorf("failed to parse external installer repository: %w", err)
 		}
+	}
+
+	var registryOpts []name.Option
+
+	if opts.Artifacts.Core.Insecure {
+		registryOpts = append(registryOpts, name.Insecure)
+	}
+
+	imageProxyRegistry, err := name.NewRegistry(opts.Artifacts.Core.Registry, registryOpts...)
+	if err != nil {
+		return frontendhttp.Options{}, fmt.Errorf("failed to parse image proxy registry: %w", err)
+	}
+
+	frontendOptions.ImageProxy = frontendhttp.ImageProxyOptions{
+		BackingRegistry: imageProxyRegistry,
+		Images:          opts.Artifacts.Core.Components.ImageMap(),
+		Namespace:       opts.Artifacts.Core.Namespace,
 	}
 
 	frontendOptions.RemoteOptions = append(frontendOptions.RemoteOptions, remoteOptions()...)
@@ -528,7 +615,7 @@ func buildArtifactsManager(logger *zap.Logger, opts Options) (*artifacts.Manager
 	return artifactsManager, nil
 }
 
-func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, imageSigner signer.Signer, opts Options) (*asset.Builder, error) {
+func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, imageSigner signer.Signer, opts Options) (*asset.Builder, assetcache.Cache, error) {
 	var (
 		cache assetcache.Cache
 		err   error
@@ -546,14 +633,16 @@ func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, 
 		repoOpts = append(repoOpts, name.Insecure)
 	}
 
+	regOptions.NameOptions = repoOpts
+
 	regOptions.CacheRepository, err = name.NewRepository(opts.Cache.OCI.String(), repoOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse cache repository: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse cache repository: %w", err)
 	}
 
 	cache, err = assetcachereg.New(logger, regOptions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize repository cache: %w", err)
+		return nil, nil, fmt.Errorf("failed to initialize repository cache: %w", err)
 	}
 
 	if opts.Cache.S3.Enabled {
@@ -567,7 +656,7 @@ func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, 
 
 		cache, err = assetcaches3.New(logger, cache, s3Options)
 		if err != nil {
-			return nil, fmt.Errorf("failed to initialize s3 cache: %w", err)
+			return nil, nil, fmt.Errorf("failed to initialize s3 cache: %w", err)
 		}
 	}
 
@@ -579,7 +668,7 @@ func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, 
 
 		cache, err = cdn.New(logger, cache, cdnOptions)
 		if err != nil {
-			return nil, fmt.Errorf("failed to initialize CDN cache: %w", err)
+			return nil, nil, fmt.Errorf("failed to initialize CDN cache: %w", err)
 		}
 	}
 
@@ -591,12 +680,12 @@ func buildAssetBuilder(logger *zap.Logger, artifactsManager *artifacts.Manager, 
 
 	builder, err := asset.NewBuilder(logger, artifactsManager, cache, builderOptions)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	prometheus.MustRegister(builder)
 
-	return builder, nil
+	return builder, cache, nil
 }
 
 func buildSchematicFactory(ctx context.Context, logger *zap.Logger, eg *errgroup.Group, opts Options) (*schematic.Factory, error) {
@@ -665,17 +754,17 @@ func remoteOptions() []remote.Option {
 	return opts
 }
 
-// buildCacheSigner constructs the image signer from options.
+// buildCacheSigner constructs the configured image signer.
 // If GSA options are configured (ServiceAccountEmail set), a keyless GSA signer is returned.
 // Otherwise, a static key signer is built from SigningKeyPath.
-func buildCacheSigner(opts Options) (signer.Signer, error) {
+func buildCacheSigner(ctx context.Context, opts Options) (signer.Signer, error) {
 	if opts.Cache.GSA.ServiceAccountEmail != "" {
-		return signer.NewGSASigner(signer.GSASignerOptions{
+		return signer.NewGSASigner(ctx, signer.GSASignerOptions{
 			ServiceAccountEmail: opts.Cache.GSA.ServiceAccountEmail,
 			KeyFile:             opts.Cache.GSA.KeyFile,
 			FulcioURL:           opts.Cache.GSA.FulcioURL,
 			RekorURL:            opts.Cache.GSA.RekorURL,
-			Insecure:            opts.Artifacts.Installer.Internal.Insecure,
+			TSAURL:              opts.Cache.GSA.TSAURL,
 		})
 	}
 

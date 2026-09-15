@@ -40,6 +40,9 @@
 - id: info.version
   translation: "Wersja"
 
+- id: nav.logout
+  translation: "Wyloguj się"
+
 - id: interface.loading
   translation: "Ładowanie..."
 
@@ -319,6 +322,12 @@
 - id: final.extra.checksum_enterprise_feature
   translation: "Sumy kontrolne są dostępne wyłącznie za pośrednictwem Talos Linux Enterprise Image Factory."
 
+- id: final.extra.signature_enterprise_feature
+  translation: "Podpisy są dostępne wyłącznie za pośrednictwem Talos Linux Enterprise Image Factory."
+
+- id: final.extra.signature_hint
+  translation: "Odłączony pakiet Sigstore do weryfikacji poleceniem cosign verify-blob."
+
 - id: final.scan.title
   translation: "Skan podatności"
 
@@ -378,3 +387,114 @@
 
 - id: final.booter.command_post
   translation: " z tym schematem, uruchom następujące polecenie na hoście w tej samej podsieci:"
+
+- id: tokens.nav_link
+  translation: "Zarządzaj tokenami API"
+
+- id: tokens.title
+  translation: "Tokeny API"
+
+- id: tokens.back_home
+  translation: "Strona główna"
+
+- id: tokens.description
+  translation: "Tokeny API to poświadczenia wydawane przez tę fabrykę. Wybierz aktora, który będzie używać tokenu; fabryka przypisze mu stały profil uprawnień zdefiniowany przez serwer."
+
+- id: tokens.table.name
+  translation: "Nazwa"
+
+- id: tokens.table.expires
+  translation: "Wygasa"
+
+- id: tokens.table.expired
+  translation: "wygasł"
+
+- id: tokens.table.created
+  translation: "Utworzono"
+
+- id: tokens.table.permissions
+  translation: "Uprawnienia"
+
+- id: tokens.empty
+  translation: "Brak tokenów."
+
+- id: tokens.create.name_label
+  translation: "Nazwa"
+
+- id: tokens.create.ttl_label
+  translation: "Czas życia"
+
+- id: tokens.create.ttl_help
+  translation: "Czas trwania w formacie Go, na przykład 24h lub 90m. Dni nie są jednostką, więc wpisz 720h zamiast 30d. Pozostaw puste, aby użyć wartości domyślnej serwera."
+
+- id: tokens.create.actor_label
+  translation: "Aktor tokenu"
+
+- id: tokens.create.actor_talos
+  translation: "Talos"
+
+- id: tokens.create.actor_talos_help
+  translation: "Pobieranie wygenerowanych obrazów i skryptów PXE oraz instalatorów i innych artefaktów OCI."
+
+- id: tokens.create.actor_automation
+  translation: "Automatyzacja (Omni / Terraform)"
+
+- id: tokens.create.actor_automation_help
+  translation: "Tworzenie i odczyt schematów, pobieranie wygenerowanych obrazów, odczyt raportów oraz wystawianie ograniczonych tokenów dla Talosa i automatyzacji."
+
+- id: tokens.create.actor_operator
+  translation: "Operator"
+
+- id: tokens.create.actor_operator_help
+  translation: "Obsługa obrazów, schematów, serwerów proxy źródeł i raportów. Bez zarządzania tokenami."
+
+- id: tokens.create.actor_admin
+  translation: "Administrator"
+
+- id: tokens.create.actor_admin_help
+  translation: "Uprawnienia operatora oraz wystawianie, wyświetlanie i unieważnianie tokenów. Może wystawiać tokeny dla dowolnego profilu aktora."
+
+- id: tokens.create.actor_required
+  translation: "Wybierz aktora tokenu."
+
+- id: tokens.create.button
+  translation: "Utwórz token"
+
+- id: tokens.create.cancel
+  translation: "Anuluj"
+
+- id: tokens.secret.title
+  translation: "Utworzono token"
+
+- id: tokens.secret.warning
+  translation: "Ten sekret jest wyświetlany tylko raz. Skopiuj go teraz, bo nie będzie można go ponownie wyświetlić."
+
+- id: tokens.secret.identity
+  translation: "Tożsamość"
+
+- id: tokens.secret.token
+  translation: "Token"
+
+- id: tokens.secret.patch
+  translation: "Fragment konfiguracji maszyny"
+
+- id: tokens.secret.close
+  translation: "Zamknij"
+
+- id: tokens.revoke.button
+  translation: "Odwołaj"
+
+- id: tokens.revoke.title
+  translation: "Odwołaj token"
+
+- id: tokens.revoke.confirm
+  translation: "Odwołać ten token? Wszyscy klienci i wszystkie węzły, które go używają, natychmiast stracą dostęp."
+
+- id: tokens.error.load
+  translation: "Nie udało się wczytać tokenów"
+
+- id: tokens.error.revoke
+  translation: "Nie udało się odwołać tokenu"
+
+- id: tokens.error.limit
+  translation: "Osiągnięto limit tokenów dla tej tożsamości"

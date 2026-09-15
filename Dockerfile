@@ -1,4 +1,4 @@
-# syntax = docker/dockerfile-upstream:1.25.0-labs
+# syntax = docker/dockerfile-upstream:1.27.0-labs
 
 ARG TOOLCHAIN=scratch
 ARG PKGS_PREFIX=scratch
@@ -11,9 +11,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache
 	&& mv /go/bin/helm-docs /bin/helm-docs
 
 # runs markdownlint
-FROM docker.io/oven/bun:1.3.14-alpine AS lint-markdown
+FROM docker.io/oven/bun:1.4.0-alpine AS lint-markdown
 WORKDIR /src
-RUN bun i markdownlint-cli@0.49.0 sentences-per-line@0.5.3
+RUN bun i markdownlint-cli@0.49.1 sentences-per-line@0.5.3
 COPY .markdownlint.json .
 COPY ./docs ./docs
 COPY ./CHANGELOG.md ./CHANGELOG.md
@@ -150,6 +150,12 @@ ENV GOTOOLCHAIN=${GOTOOLCHAIN}
 ARG GOEXPERIMENT
 ENV GOEXPERIMENT=${GOEXPERIMENT}
 ENV GOPATH=/go
+ARG GOIMPORTS_VERSION
+RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go install golang.org/x/tools/cmd/goimports@v${GOIMPORTS_VERSION}
+RUN mv /go/bin/goimports /bin
+ARG GOMOCK_VERSION
+RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go install go.uber.org/mock/mockgen@v${GOMOCK_VERSION}
+RUN mv /go/bin/mockgen /bin
 ARG DEEPCOPY_VERSION
 RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go install github.com/siderolabs/deep-copy@${DEEPCOPY_VERSION} \
 	&& mv /go/bin/deep-copy /bin/deep-copy
@@ -181,6 +187,7 @@ COPY go.sum go.sum
 RUN cd .
 RUN --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go mod download
 RUN --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go mod verify
+COPY ./api ./api
 COPY ./cmd ./cmd
 COPY ./internal ./internal
 COPY ./pkg ./pkg
@@ -196,9 +203,12 @@ RUN mkdir -p internal/version/data && \
     echo -n ${SHA} > internal/version/data/sha && \
     echo -n ${TAG} > internal/version/data/tag
 
-# run the docgen
-FROM base AS docgen
-RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go run ./tools/docgen ./cmd/image-factory/cmd/options.go docs/configuration.md
+# run go generate
+FROM base AS go-generate-0
+WORKDIR /src
+COPY .license-header.go.txt hack/.license-header.go.txt
+RUN --mount=type=cache,target=/root/.cache/go-build,id=image-factory/root/.cache/go-build --mount=type=cache,target=/go/pkg,id=image-factory/go/pkg go generate ./internal/...
+RUN goimports -w -local github.com/siderolabs/image-factory ./internal
 
 # builds the integration test binary
 FROM base AS integration-build
@@ -253,7 +263,7 @@ RUN echo -n 'undefined' > internal/version/data/sha && \
 
 # copies out the generated docs
 FROM scratch AS docs
-COPY --from=docgen /src/docs/configuration.md /configuration.md
+COPY --from=go-generate-0 /src/docs/configuration.md /configuration.md
 
 # copies out the integration test binary
 FROM scratch AS integration.test
@@ -272,6 +282,7 @@ COPY --from=unit-tests-run /src/coverage.txt /coverage-unit-tests.txt
 
 # cleaned up specs and compiled versions
 FROM scratch AS generate
+COPY --from=go-generate-0 /src/docs/configuration.md docs/configuration.md
 COPY --from=embed-abbrev-generate /src/internal/version internal/version
 
 # builds image-factory-linux-amd64
